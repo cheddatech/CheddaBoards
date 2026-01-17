@@ -1,0 +1,63 @@
+# =====================================================
+# CheddaBoards Netlify Configuration
+# =====================================================
+
+[build]
+  # Functions are in netlify/functions
+  functions = "netlify/functions"
+  
+  # Install dependencies for functions
+  command = "npm install"
+
+[functions]
+  # Bundle functions with esbuild for faster cold starts
+  node_bundler = "esbuild"
+  
+  # Include external modules that need special handling
+  external_node_modules = ["@dfinity/agent", "@dfinity/identity", "jose"]
+
+# =====================================================
+# API Redirects - Route /api/* to the api function
+# =====================================================
+
+[[redirects]]
+  from = "/api/*"
+  to = "/.netlify/functions/api/:splat"
+  status = 200
+
+[[redirects]]
+  from = "/auth/*"
+  to = "/.netlify/functions/auth-verify"
+  status = 200
+
+# =====================================================
+# Headers - CORS for API endpoints
+# =====================================================
+
+[[headers]]
+  for = "/.netlify/functions/*"
+  [headers.values]
+    Access-Control-Allow-Origin = "*"
+    Access-Control-Allow-Methods = "GET, POST, PUT, DELETE, OPTIONS"
+    Access-Control-Allow-Headers = "Content-Type, X-API-Key, X-Game-ID, X-Session-Token, Authorization"
+
+# =====================================================
+# Environment Variable Context
+# =====================================================
+# 
+# Set these in Netlify Dashboard > Site settings > Environment variables:
+#
+# Required:
+#   CANISTER_ID              - Your deployed canister ID
+#   CHEDDA_CANISTER_ID       - Same as above (for auth-verify)
+#   VERIFIER_IDENTITY_JSON   - Ed25519 identity for creating sessions
+#   GOOGLE_CLIENT_ID         - Google OAuth client ID
+#   APPLE_SERVICE_ID         - Apple Sign In service ID
+#   APPLE_BUNDLE_ID          - Apple app bundle ID
+#   ALLOWED_ORIGINS          - Comma-separated list of allowed CORS origins
+#
+# Optional:
+#   ICP_HOST                 - ICP API host (default: https://icp-api.io)
+#   DFX_HOST                 - Same as above (for auth-verify)
+#   GOOGLE_CLIENT_IDS        - Comma-separated fallback Google client IDs
+#
