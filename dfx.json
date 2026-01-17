@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "canisters": {
+    "cheddaboards": {
+      "type": "motoko",
+      "main": "src/main.mo"
+    }
+  },
+  "defaults": {
+    "build": {
+      "packtool": ""
+    }
+  },
+  "networks": {
+    "local": {
+      "bind": "127.0.0.1:4943",
+      "type": "ephemeral"
+    },
+    "ic": {
+      "providers": ["https://icp-api.io"],
+      "type": "persistent"
+    }
+  },
+  "output_env_file": ".env.dfx"
+}
