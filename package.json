@@ -1,0 +1,40 @@
+{
+  "name": "cheddaboards",
+  "version": "0.7.0",
+  "description": "Post-Infrastructure gaming backend for indie developers",
+  "private": true,
+  "scripts": {
+    "generate-did": "dfx generate cheddaboards",
+    "deploy:local": "dfx deploy --network local",
+    "deploy:ic": "dfx deploy --network ic",
+    "test": "echo \"No tests yet\" && exit 0"
+  },
+  "dependencies": {
+    "@dfinity/agent": "^1.0.0",
+    "@dfinity/identity": "^1.0.0",
+    "@dfinity/principal": "^1.0.0",
+    "jose": "^5.2.0"
+  },
+  "devDependencies": {
+    "@netlify/functions": "^2.4.0",
+    "typescript": "^5.3.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/cheddatech/cheddaboards.git"
+  },
+  "keywords": [
+    "gaming",
+    "leaderboards",
+    "achievements",
+    "icp",
+    "internet-computer",
+    "web3",
+    "backend"
+  ],
+  "author": "CheddaTech Ltd",
+  "license": "MIT"
+}
