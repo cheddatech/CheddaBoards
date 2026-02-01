@@ -1,8 +1,6 @@
 // main.mo - CheddaBoards Backend
-// NOTE: Behaviour frozen as of 2026-01-15
-// Refactor in progress — no logic changes intended
-//
-// ⚠️  SETUP REQUIRED: Search for "REPLACE WITH YOUR" and set:
+
+//     SETUP REQUIRED: Search for "REPLACE WITH YOUR" and set:
 //     - VERIFIER: Your OAuth token verifier canister principal
 //     - CONTROLLER: Your super admin principal (usually your dfx identity)
 //     - firstAdmin: Initial admin principal (can be same as CONTROLLER)
@@ -29,390 +27,86 @@ import Nat32 "mo:base/Nat32";
 import Error "mo:base/Error";
 import Char "mo:base/Char";
 
+import Types "types";
+import Files "files";
+import ApiKeys "apikeys";
+import Players "players";
+import Scoreboards "scoreboards";
+
 persistent actor CheddaBoards {
 
   // ════════════════════════════════════════════════════════════════════════════
-  // TYPES
+  // TYPE ALIASES (from Types module)
   // ════════════════════════════════════════════════════════════════════════════
 
-  // ==================== SECURITY TYPES ====================
+  // Core Identity
+  type UserIdentifier = Types.UserIdentifier;
+  type AuthType = Types.AuthType;
+  type DeveloperTier = Types.DeveloperTier;
 
-  type AdminRole = {
-    #SuperAdmin;
-    #Moderator;
-    #Support;
-    #ReadOnly;
-  };
+  // Sessions
+  type Session = Types.Session;
+  type PlaySession = Types.PlaySession;
+  type TimeValidationResult = Types.TimeValidationResult;
 
-  type AdminAction = {
-    timestamp : Nat64;
-    admin : Principal;
-    adminRole : AdminRole;
-    command : Text;
-    args : [Text];
-    success : Bool;
-    result : Text;
-    ipAddress : ?Text;
-  };
+  // Users / Players
+  type GameProfile = Types.GameProfile;
+  type UserProfile = Types.UserProfile;
+  type PublicUserProfile = Types.PublicUserProfile;
 
-  type DeletedGame = {
-    game : GameInfo;
-    deletedBy : Principal;
-    deletedAt : Nat64;
-    permanentDeletionAt : Nat64;
-    reason : Text;
-    canRecover : Bool;
-  };
+  // Games
+  type AccessMode = Types.AccessMode;
+  type GameInfo = Types.GameInfo;
+  type GameInfoLegacy = Types.GameInfoLegacy;
+  type GameInfoV2 = Types.GameInfoV2;
+  type DeletedGame = Types.DeletedGame;
+  type DeletedGameLegacy = Types.DeletedGameLegacy;
+  type DeletedGameV2 = Types.DeletedGameV2;
+  type DeletionAttempt = Types.DeletionAttempt;
 
-  type DeletionAttempt = {
-    timestamp : Nat64;
-    gameId : Text;
-  };
+  // Scoreboards
+  type SortBy = Types.SortBy;
+  type ScoreboardPeriod = Types.ScoreboardPeriod;
+  type ScoreboardConfig = Types.ScoreboardConfig;
+  type ScoreEntry = Types.ScoreEntry;
+  type PublicScoreEntry = Types.PublicScoreEntry;
+  type Scoreboard = Types.Scoreboard;
+  type ArchivedScoreboard = Types.ArchivedScoreboard;
+  type ArchiveInfo = Types.ArchiveInfo;
 
-  type DeletedUser = {
-    user : UserProfile;
-    deletedBy : Principal;
-    deletedAt : Nat64;
-    permanentDeletionAt : Nat64;
-    reason : Text;
-    canRecover : Bool;
-  };
+  // API Keys
+  type ApiKey = Types.ApiKey;
 
-  type PendingDeletion = {
-    userId : Text;
-    userType : Text;
-    requestedBy : Principal;
-    requestedAt : Nat64;
-    confirmationCode : Text;
-    expiresAt : Nat64;
-  };
+  // Analytics
+  type AnalyticsEvent = Types.AnalyticsEvent;
+  type DailyStats = Types.DailyStats;
+  type PlayerStats = Types.PlayerStats;
 
-  type BackupData = {
-    version : Text;
-    timestamp : Nat64;
-    createdBy : Principal;
-    emailUsers : [(Text, UserProfile)];
-    principalUsers : [(Principal, UserProfile)];
-    games : [(Text, GameInfo)];
-    deletedUsers : [(Text, DeletedUser)];
-    metadata : {
-      totalUsers : Nat;
-      totalGames : Nat;
-      totalGameProfiles : Nat;
-      totalDeletedUsers : Nat;
-    };
-  };
+  // Admin / Security
+  type AdminRole = Types.AdminRole;
+  type AdminAction = Types.AdminAction;
+  type DeletedUser = Types.DeletedUser;
+  type PendingDeletion = Types.PendingDeletion;
+  type BackupData = Types.BackupData;
 
-  type HeaderField = (Text, Text);
+  // HTTP
+  type HeaderField = Types.HeaderField;
+  type HttpRequest = Types.HttpRequest;
+  type HttpResponse = Types.HttpResponse;
+  type StreamingStrategy = Types.StreamingStrategy;
+  type StreamingCallbackToken = Types.StreamingCallbackToken;
+  type StreamingCallbackResponse = Types.StreamingCallbackResponse;
 
-  type HttpRequest = {
-    method : Text;
-    url : Text;
-    headers : [HeaderField];
-    body : Blob;
-  };
-
-  type HttpResponse = {
-    status_code : Nat16;
-    headers : [HeaderField];
-    body : Blob;
-    streaming_strategy : ?StreamingStrategy;
-  };
-
-  type StreamingStrategy = {
-    #Callback : {
-      callback : shared query StreamingCallbackToken -> async StreamingCallbackResponse;
-      token : StreamingCallbackToken;
-    };
-  };
-
-  type StreamingCallbackToken = {
-    key : Text;
-    index : Nat;
-    content_encoding : Text;
-  };
-
-  type StreamingCallbackResponse = {
-    body : Blob;
-    token : ?StreamingCallbackToken;
-  };
-
-  public type UserIdentifier = {
-    #email: Text;
-    #principal: Principal;
-  };
-
-  public type AuthType = {
-    #internetIdentity;
-    #google;
-    #apple;
-    #external;
-  };
-
-  type DeveloperTier = {
-    #free;      // 3 games
-    #pro;       // 10 games
-};
-
-  public type Session = {
-    sessionId : Text;
-    email : Text;
-    nickname : Text;
-    authType : AuthType;
-    created : Nat64;
-    expires : Nat64;
-    lastUsed : Nat64;
-  };
-
-  public type GameProfile = {
-    gameId : Text;
-    total_score : Nat64;
-    best_streak : Nat64;
-    achievements : [Text];
-    last_played : Nat64;
-    play_count : Nat;
-  };
-
-  public type UserProfile = {
-    identifier : UserIdentifier;
-    nickname : Text;
-    authType : AuthType;
-    gameProfiles : [(Text, GameProfile)];
-    created : Nat64;
-    last_updated : Nat64;
-  };
-
-  public type PublicUserProfile = {
-    nickname : Text;
-    authType : AuthType;
-    gameProfiles : [(Text, GameProfile)];
-    created : Nat64;
-    last_updated : Nat64;
-  };
-
-  public type AccessMode = {
-    #webOnly; 
-    #apiOnly;  
-    #both;
-  };
-
-  type GameInfoLegacy = {
-    gameId: Text;
-    name: Text;
-    description: Text;
-    owner: Principal;
-    created: Nat64;
-    isActive: Bool;
-    totalPlayers: Nat;
-    totalPlays: Nat;
-    accessMode: AccessMode;
-    maxScorePerRound: ?Nat64;
-    maxStreakDelta: ?Nat64;
-    absoluteScoreCap: ?Nat64;
-    absoluteStreakCap: ?Nat64;
-    gameUrl: ?Text;
-};
-
-// V2 type - with OAuth fields but without time validation (currently deployed)
-type GameInfoV2 = {
-    gameId: Text;
-    name: Text;
-    description: Text;
-    owner: Principal;
-    created: Nat64;
-    isActive: Bool;
-    totalPlayers: Nat;
-    totalPlays: Nat;
-    accessMode: AccessMode;
-    maxScorePerRound: ?Nat64;
-    maxStreakDelta: ?Nat64;
-    absoluteScoreCap: ?Nat64;
-    absoluteStreakCap: ?Nat64;
-    gameUrl: ?Text;
-    googleClientIds: [Text];
-    appleBundleId: ?Text;
-    appleTeamId: ?Text;
-};
-
-type DeletedGameV2 = {
-    game: GameInfoV2;
-    deletedBy: Principal;
-    deletedAt: Nat64;
-    permanentDeletionAt: Nat64;
-    reason: Text;
-    canRecover: Bool;
-};
-
-type DeletedGameLegacy = {
-    game: GameInfoLegacy;
-    deletedBy: Principal;
-    deletedAt: Nat64;
-    permanentDeletionAt: Nat64;
-    reason: Text;
-    canRecover: Bool;
-};
-
-public type GameInfo = {
-  gameId : Text;
-  name : Text;
-  description : Text;
-  owner : Principal;
-  gameUrl : ?Text;
-  created : Nat64;
-  accessMode : AccessMode;
-  totalPlayers : Nat;
-  totalPlays : Nat;
-  isActive : Bool;
-  maxScorePerRound : ?Nat64;
-  maxStreakDelta : ?Nat64;
-  absoluteScoreCap : ?Nat64;
-  absoluteStreakCap : ?Nat64;
-  timeValidationEnabled : Bool;       // Master toggle for this feature
-  minPlayDurationSecs : ?Nat64;       // e.g., 30 = must play at least 30 seconds
-  maxScorePerSecond : ?Nat64;         // e.g., 500 = max 500 points per second played
-  maxSessionDurationMins : ?Nat;      // e.g., 60 = sessions expire after 60 mins (default 30)
-  googleClientIds : [Text];
-  appleBundleId : ?Text;
-  appleTeamId : ?Text;   
-};
-
-  public type AnalyticsEvent = {
-    eventType : Text;
-    gameId : Text;
-    identifier : UserIdentifier;
-    timestamp : Nat64;
-    metadata : [(Text, Text)];
-  };
-
-  public type DailyStats = {
-    date : Text;
-    gameId : Text;
-    uniquePlayers : Nat;
-    totalGames : Nat;
-    totalScore : Nat64;
-    newUsers : Nat;
-    authenticatedPlays : Nat;
-  };
-
-  public type PlayerStats = {
-    gameId : Text;
-    identifier : UserIdentifier;
-    totalGames : Nat;
-    avgScore : Nat64;
-    playStreak : Nat;
-    lastPlayed : Nat64;
-    favoriteTime : Text;
-  };
-
-  public type ApiKey = {
-    key : Text;
-    gameId : Text;
-    owner : Principal;
-    created : Int;
-    lastUsed : Int;
-    tier : Text;   
-    requestsToday : Nat;
-    isActive : Bool;
-  };
-
-  public type SortBy = { #score; #streak };
-
-  // ==================== PLAY SESSION TYPES ====================
-
-  type PlaySession = {
-    sessionToken: Text;           // Unique token for this play session
-    identifier: UserIdentifier;   // Who's playing
-    gameId: Text;                 // Which game
-    startedAt: Nat64;             // When they started (server timestamp)
-    expiresAt: Nat64;             // Auto-expire if not submitted (prevents token hoarding)
-    isActive: Bool;               // Still valid for submission
-  };
-
-  type TimeValidationResult = {
-    isValid: Bool;
-    playDuration: Nat64;          // Actual seconds played
-    reason: ?Text;                // Why it failed (if invalid)
-  };
-
-  // ==================== SCOREBOARD TYPES ====================
-
-  // Period type for scoreboards
-  public type ScoreboardPeriod = {
-    #allTime;    // Never resets
-    #daily;      // Resets daily at midnight UTC
-    #weekly;     // Resets weekly on Monday midnight UTC
-    #monthly;    // Resets on 1st of each month
-    #custom;     // Manual reset by developer
-  };
-
-  // Scoreboard configuration (set by developer)
-  public type ScoreboardConfig = {
-    scoreboardId : Text;        // Unique ID within the game
-    gameId : Text;              // Parent game
-    name : Text;                // Display name (e.g., "Weekly Leaderboard")
-    description : Text;         // Optional description
-    period : ScoreboardPeriod;  // Reset period
-    sortBy : SortBy;            // Sort by score or streak
-    maxEntries : Nat;           // Max entries to track (default 100)
-    created : Nat64;
-    lastReset : Nat64;          // Last time this scoreboard was reset
-    isActive : Bool;
-  };
-
-  // Individual score entry for a scoreboard
-  public type ScoreEntry = {
-    odentifier : UserIdentifier;  // Who submitted (named for backwards compat)
-    nickname : Text;
-    score : Nat64;
-    streak : Nat64;
-    submittedAt : Nat64;          // When this score was submitted
-    authType : AuthType;
-  };
-
-  // Public view of a scoreboard entry (no identifier exposed)
-  public type PublicScoreEntry = {
-    nickname : Text;
-    score : Nat64;
-    streak : Nat64;
-    submittedAt : Nat64;
-    authType : Text;
-    rank : Nat;
-  };
-
-  // Full scoreboard with entries
-  public type Scoreboard = {
-    config : ScoreboardConfig;
-    entries : [ScoreEntry];
-  };
-
-  public type ArchivedScoreboard = {
-    scoreboardId : Text;        // Which scoreboard this archive is from
-    gameId : Text;              // Parent game
-    name : Text;                // Display name at time of archive
-    period : ScoreboardPeriod;  // weekly, daily, monthly, etc.
-    sortBy : SortBy;            // score or streak
-    periodStart : Nat64;        // When this period started
-    periodEnd : Nat64;          // When this period ended (reset time)
-    entries : [ScoreEntry];     // Frozen entries at time of reset
-    totalEntries : Nat;         // Count of entries
-  };
-
-  // Archive query result (lighter weight for listing)
-  public type ArchiveInfo = {
-    archiveId : Text;           // "gameId:scoreboardId:timestamp"
-    scoreboardId : Text;        // Which scoreboard
-    periodStart : Nat64;        // When period started
-    periodEnd : Nat64;          // When period ended
-    entryCount : Nat;           // How many entries
-    topPlayer : ?Text;          // Nickname of #1 player
-    topScore : Nat64;           // Top score/streak value
-  };
-
+  // Result alias (keep local since it's from base)
   type Result<Ok, Err> = Result.Result<Ok, Err>;
+
+  // ════════════════════════════════════════════════════════════════════════════
+  // CONSTANTS
+  // ════════════════════════════════════════════════════════════════════════════
 
   // TODO: Set via deployment - this is your OAuth token verifier canister
   let VERIFIER : Principal = Principal.fromText("aaaaa-aa"); // REPLACE WITH YOUR VERIFIER PRINCIPAL
-
+  
   // ════════════════════════════════════════════════════════════════════════════
   // STABLE STORAGE
   // ════════════════════════════════════════════════════════════════════════════
@@ -490,17 +184,17 @@ public type GameInfo = {
   private transient var scoreboardLastUpdate = HashMap.HashMap<Text, Nat64>(50, Text.equal, Text.hash);
   private transient let SCOREBOARD_CACHE_TTL : Nat64 = 30_000_000_000; // 30 seconds
   private transient var scoreboardArchives = HashMap.HashMap<Text, ArchivedScoreboard>(100, Text.equal, Text.hash);
-  private let MAX_ARCHIVES_PER_SCOREBOARD : Nat = 52;     // Config: how many archives to keep per scoreboard (52 weeks = 1 year)
   private transient var playSessions = HashMap.HashMap<Text, PlaySession>(100, Text.equal, Text.hash);
 
+  // DEPRECATED - kept for stable storage compatibility, use Scoreboards.MAX_ARCHIVES_PER_SCOREBOARD instead
+  private let MAX_ARCHIVES_PER_SCOREBOARD : Nat = 52;
+  
   // ════════════════════════════════════════════════════════════════════════════
   // CONSTANTS
   // ════════════════════════════════════════════════════════════════════════════
 
   // TODO: Set via deployment - this is the super admin principal
   private var CONTROLLER : Principal = Principal.fromText("aaaaa-aa"); // REPLACE WITH YOUR CONTROLLER PRINCIPAL
-  private transient let MAX_FILE_SIZE : Nat = 5_000_000;
-  private transient let MAX_FILES : Nat = 100;
   private transient let SESSION_DURATION_NS : Nat64 = 24 * 60 * 60 * 1_000_000_000;
   private transient var lastCleanup : Nat64 = 0;
   private transient let MAX_GAMES_PER_DEVELOPER : Nat = 3;
@@ -562,50 +256,6 @@ public type GameInfo = {
     }
 };
 
-  private func generateDefaultNickname() : Text {
-    userIdCounter += 1;
-    "Player_" # Nat.toText(userIdCounter)
-  };
-
-  private func isDefaultNickname(nickname : Text) : Bool {
-    nickname == "Player" or Text.startsWith(nickname, #text "Player_")
-  };
-
-  private func isNicknameTaken(nickname : Text, excludeIdentifier : ?UserIdentifier) : Bool {
-    // Check email users
-    for ((_, user) in usersByEmail.entries()) {
-        if (user.nickname == nickname) {
-            switch (excludeIdentifier) {
-                case (?id) {
-                    if (identifierToText(user.identifier) != identifierToText(id)) {
-                        return true;
-                    };
-                };
-                case null { return true };
-            };
-        };
-    };
-    
-    // Check principal users
-    for ((_, user) in usersByPrincipal.entries()) {
-        if (user.nickname == nickname) {
-            switch (excludeIdentifier) {
-                case (?id) {
-                    if (identifierToText(user.identifier) != identifierToText(id)) {
-                        return true;
-                    };
-                };
-                case null { return true };
-            };
-        };
-    };
-    
-    false
-  };
-
-  private func looksLikeEmail(text : Text) : Bool {
-    Text.contains(text, #char '@')
-  };
   
   private func getMaxGamesForDeveloper(owner: Principal) : Nat {
     switch (developerTiers.get(owner)) {
@@ -626,34 +276,6 @@ private func getDeveloperTierText(owner: Principal) : Text {
     let timestamp = now();
     let _random = Random.Finite(Blob.fromArray([1,2,3,4,5,6,7,8]));
     "session_" # Nat64.toText(timestamp) # "_" # Nat64.toText(sessionCounter)
-  };
-
-  func authTypeToText(auth : AuthType) : Text {
-    switch (auth) {
-      case (#internetIdentity) "internetIdentity";
-      case (#google) "google";
-      case (#apple) "apple";
-      case (#external) "external";
-    }
-  };
-
-  func accessModeToText(mode : AccessMode) : Text {
-    switch (mode) {
-      case (#webOnly) "webOnly";
-      case (#apiOnly) "apiOnly";
-      case (#both) "both";
-    }
-  };
-
-  func identifierToText(id : UserIdentifier) : Text {
-    switch (id) {
-      case (#email(e)) "email:" # e;
-      case (#principal(p)) "principal:" # Principal.toText(p);
-    }
-  };
-
-  func makeSubmitKey(identifier : UserIdentifier, gameId : Text) : Text {
-    identifierToText(identifier) # ":" # gameId
   };
 
   func logSuspicion(playerId : Text, gameId : Text, reason : Text) {
@@ -685,24 +307,6 @@ private func getDeveloperTierText(owner: Principal) : Text {
     else { "evening" }
   };
 
-  // Validate external player ID format
-  private func isValidExternalPlayerId(playerId : Text) : Bool {
-    let size = Text.size(playerId);
-    if (size == 0 or size > 100) {
-      return false;
-    };
-    // Allow alphanumeric, underscore, hyphen
-    for (char in playerId.chars()) {
-      let valid = Char.isAlphabetic(char) or 
-                  Char.isDigit(char) or 
-                  char == '_' or 
-                  char == '-';
-      if (not valid) {
-        return false;
-      };
-    };
-    true
-  };
 
   func cleanupExpiredSessions() {
     let currentTime = now();
@@ -818,6 +422,96 @@ private func getDeveloperTierText(owner: Principal) : Text {
         }
       };
     }
+  };
+
+  // ════════════════════════════════════════════════════════════════════════════
+  // PLAYER HELPERS (delegated to Players module)
+  // ════════════════════════════════════════════════════════════════════════════
+
+  func identifierToText(id : UserIdentifier) : Text {
+    Players.identifierToText(id)
+  };
+
+  func makeSubmitKey(identifier : UserIdentifier, gameId : Text) : Text {
+    Players.makeSubmitKey(identifier, gameId)
+  };
+
+  private func generateDefaultNickname() : Text {
+    userIdCounter += 1;
+    Players.generateDefaultNickname(userIdCounter)
+  };
+
+  private func isDefaultNickname(nickname : Text) : Bool {
+    Players.isDefaultNickname(nickname)
+  };
+
+  private func isNicknameTaken(nickname : Text, excludeIdentifier : ?UserIdentifier) : Bool {
+    Players.isNicknameTaken(
+      nickname,
+      excludeIdentifier,
+      usersByEmail.entries(),
+      usersByPrincipal.entries()
+    )
+  };
+
+  private func looksLikeEmail(text : Text) : Bool {
+    Players.looksLikeEmail(text)
+  };
+
+  private func isValidExternalPlayerId(playerId : Text) : Bool {
+    Players.isValidExternalPlayerId(playerId)
+  };
+
+  func validateNickname(nickname: Text) : Result.Result<(), Text> {
+    Players.validateNickname(nickname)
+  };
+
+  // ════════════════════════════════════════════════════════════════════════════
+  // SCOREBOARD HELPERS (delegated to Scoreboards module)
+  // ════════════════════════════════════════════════════════════════════════════
+
+  func authTypeToText(auth : AuthType) : Text {
+    Scoreboards.authTypeToText(auth)
+  };
+
+  func accessModeToText(mode : AccessMode) : Text {
+    Scoreboards.accessModeToText(mode)
+  };
+
+  private func makeArchiveKey(gameId : Text, scoreboardId : Text, timestamp : Nat64) : Text {
+    Scoreboards.makeArchiveKey(gameId, scoreboardId, timestamp)
+  };
+
+  private func shouldResetDaily(lastReset : Nat64, currentTime : Nat64) : Bool {
+    Scoreboards.shouldResetDaily(lastReset, currentTime)
+  };
+
+  private func shouldResetWeekly(lastReset : Nat64, currentTime : Nat64) : Bool {
+    Scoreboards.shouldResetWeekly(lastReset, currentTime)
+  };
+
+  private func shouldResetMonthly(lastReset : Nat64, currentTime : Nat64) : Bool {
+    Scoreboards.shouldResetMonthly(lastReset, currentTime)
+  };
+
+  private func identifiersEqual(a : UserIdentifier, b : UserIdentifier) : Bool {
+    Scoreboards.identifiersEqual(a, b)
+  };
+
+  private func makeScoreboardKey(gameId : Text, scoreboardId : Text) : Text {
+    Scoreboards.makeKey(gameId, scoreboardId)
+  };
+
+  private func scoreboardNeedsReset(config : ScoreboardConfig) : Bool {
+    Scoreboards.needsReset(config, now())
+  };
+
+  private func periodToText(period : ScoreboardPeriod) : Text {
+    Scoreboards.periodToText(period)
+  };
+
+  private func textToPeriod(text : Text) : ?ScoreboardPeriod {
+    Scoreboards.textToPeriod(text)
   };
 
   // ═══════════════════════════════════════════════════════════════════════════════
@@ -1023,10 +717,6 @@ private func getDeveloperTierText(owner: Principal) : Text {
     count
   };
 
-   private func makeArchiveKey(gameId : Text, scoreboardId : Text, timestamp : Nat64) : Text {
-    gameId # ":" # scoreboardId # ":" # Nat64.toText(timestamp)
-  };
-
   // Archive a scoreboard before reset - call this before clearing entries
   private func archiveScoreboard(key : Text, config : ScoreboardConfig) : () {
     let entriesBuffer = switch (scoreboardEntries.get(key)) {
@@ -1119,7 +809,7 @@ private func getDeveloperTierText(owner: Principal) : Text {
     };
     
     // If under limit, nothing to do
-    if (archiveKeys.size() <= MAX_ARCHIVES_PER_SCOREBOARD) {
+    if (archiveKeys.size() <= Scoreboards.MAX_ARCHIVES_PER_SCOREBOARD) {
       return;
     };
     
@@ -1134,37 +824,12 @@ private func getDeveloperTierText(owner: Principal) : Text {
     );
     
     // Remove oldest archives
-    let toRemove = sorted.size() - MAX_ARCHIVES_PER_SCOREBOARD;
+    let toRemove = sorted.size() - Scoreboards.MAX_ARCHIVES_PER_SCOREBOARD;
     for (i in Iter.range(0, toRemove - 1)) {
       scoreboardArchives.delete(sorted[i].0);
     };
   };
 
-    // Check if daily scoreboard should reset
-  private func shouldResetDaily(lastReset : Nat64, currentTime : Nat64) : Bool {
-    let dayInNanos : Nat64 = 86_400_000_000_000;
-    currentTime - lastReset >= dayInNanos
-  };
-
-  // Check if weekly scoreboard should reset
-  private func shouldResetWeekly(lastReset : Nat64, currentTime : Nat64) : Bool {
-    let weekInNanos : Nat64 = 604_800_000_000_000;
-    currentTime - lastReset >= weekInNanos
-  };
-
-  // Check if monthly scoreboard should reset
-  private func shouldResetMonthly(lastReset : Nat64, currentTime : Nat64) : Bool {
-    let monthInNanos : Nat64 = 2_592_000_000_000_000;
-    currentTime - lastReset >= monthInNanos
-  };
-
-  private func identifiersEqual(a : UserIdentifier, b : UserIdentifier) : Bool {
-    switch (a, b) {
-      case (#principal(p1), #principal(p2)) { Principal.equal(p1, p2) };
-      case (#email(e1), #email(e2)) { e1 == e2 };
-      case _ { false };
-    }
-  };
 
  private func updateScoreboardsForGame(
     gameId : Text,
@@ -1480,32 +1145,6 @@ private func getDeveloperTierText(owner: Principal) : Text {
         };
       };
       case null {}; // No limit set, skip validation
-    };
-    
-    #ok(())
-  };
-  
-  func validateNickname(nickname: Text) : Result.Result<(), Text> {
-    let length = Text.size(nickname);
-    
-    if (length < 3) {
-      return #err("Nickname must be at least 3 characters");
-    };
-    
-    if (length > 12) {
-      return #err("Nickname must be 12 characters or less");
-    };
-    
-    let chars = Text.toIter(nickname);
-    for (char in chars) {
-      let isValid = (char >= 'a' and char <= 'z') or
-                    (char >= 'A' and char <= 'Z') or
-                    (char >= '0' and char <= '9') or
-                    (char == '_');
-      
-      if (not isValid) {
-        return #err("Nickname can only contain letters, numbers, and underscores");
-      };
     };
     
     #ok(())
@@ -2259,7 +1898,7 @@ system func postupgrade() {
     );
     playSessionsStable := [];
 
-    // TODO: Set via deployment - initial admin (can be same as CONTROLLER or different)
+     // TODO: Set via deployment - initial admin (can be same as CONTROLLER or different)
     let firstAdmin = Principal.fromText("aaaaa-aa"); // REPLACE WITH YOUR ADMIN PRINCIPAL
     adminRoles.put(firstAdmin, #SuperAdmin);
 };
@@ -3680,14 +3319,13 @@ public shared query(msg) func getRemainingGameSlots() : async Nat {
     if (count >= maxGames) { 0 } else { maxGames - count }
 };
 
-  // ════════════════════════════════════════════════════════════════════════════
-  // API KEY MANAGEMENT
+// ════════════════════════════════════════════════════════════════════════════
+  // API KEYS
   // ════════════════════════════════════════════════════════════════════════════
 
-  // Generate API key for a game (owner only)
   public shared(msg) func generateApiKey(gameId : Text) : async Result.Result<Text, Text> {
     let game = switch (games.get(gameId)) {
-      case null { return #err("Game not found"); };
+      case null { return #err("Game not found") };
       case (?g) { g };
     };
     
@@ -3695,41 +3333,23 @@ public shared query(msg) func getRemainingGameSlots() : async Nat {
       return #err("Only the game owner can generate API keys");
     };
     
-    // Check if active key already exists
-    for ((key, apiKey) in apiKeys.entries()) {
-      if (apiKey.gameId == gameId and apiKey.isActive) {
-        return #err("Active API key exists. Revoke it first to generate a new one.");
-      };
+    if (ApiKeys.hasActiveKey(apiKeys, gameId)) {
+      return #err("Active API key exists. Revoke it first to generate a new one.");
     };
     
-    let timestamp = Time.now();
-    let hash = Text.hash(gameId # Int.toText(timestamp) # Principal.toText(msg.caller));
-    let key = "cb_" # gameId # "_" # Nat32.toText(hash);
-    
-    let apiKey : ApiKey = {
-      key = key;
-      gameId = gameId;
-      owner = msg.caller;
-      created = timestamp;
-      lastUsed = timestamp;
-      tier = "free";
-      requestsToday = 0;
-      isActive = true;
-    };
-    
-    apiKeys.put(key, apiKey);
+    let newKey = ApiKeys.createKey(gameId, msg.caller);
+    apiKeys.put(newKey.key, newKey);
     
     trackEventInternal(#principal(msg.caller), gameId, "api_key_generated", [
       ("gameId", gameId)
     ]);
     
-    #ok(key)
+    #ok(newKey.key)
   };
 
-  // Get API key for a game (owner only)
   public shared(msg) func getApiKey(gameId : Text) : async Result.Result<Text, Text> {
     let game = switch (games.get(gameId)) {
-      case null { return #err("Game not found"); };
+      case null { return #err("Game not found") };
       case (?g) { g };
     };
     
@@ -3737,58 +3357,30 @@ public shared query(msg) func getRemainingGameSlots() : async Nat {
       return #err("Only the game owner can view API keys");
     };
     
-    for ((key, apiKey) in apiKeys.entries()) {
-      if (apiKey.gameId == gameId and apiKey.isActive) {
-        return #ok(key);
-      };
-    };
-    
-    #err("No API key found. Generate one first.")
+    switch (ApiKeys.getActiveKey(apiKeys, gameId)) {
+      case (?key) { #ok(key) };
+      case null { #err("No API key found. Generate one first.") };
+    }
   };
 
- // Check if game has API key
   public query func hasApiKey(gameId : Text) : async Bool {
-      for ((_, apiKey) in apiKeys.entries()) {
-          if (apiKey.gameId == gameId and apiKey.isActive) {
-              return true;
-          };
-      };
-      false
+    ApiKeys.hasActiveKey(apiKeys, gameId)
   };
 
-  // Validate API key (called by proxy) - query for efficiency
   public query func validateApiKeyQuery(key : Text) : async ?{
     gameId : Text;
     tier : Text;
     isActive : Bool;
   } {
-    switch (apiKeys.get(key)) {
-      case null { null };
-      case (?apiKey) {
-        if (apiKey.isActive) {
-          ?{ gameId = apiKey.gameId; tier = apiKey.tier; isActive = true }
-        } else { null }
-      };
-    }
+    ApiKeys.validate(apiKeys, key)
   };
 
-  // Full API key validation (update call to track usage)
   public shared func validateApiKey(key : Text) : async ?ApiKey {
     switch (apiKeys.get(key)) {
       case null { null };
       case (?apiKey) {
         if (apiKey.isActive) {
-          // Update last used time
-          let updated : ApiKey = {
-            key = apiKey.key;
-            gameId = apiKey.gameId;
-            owner = apiKey.owner;
-            created = apiKey.created;
-            lastUsed = Time.now();
-            tier = apiKey.tier;
-            requestsToday = apiKey.requestsToday + 1;
-            isActive = apiKey.isActive;
-          };
+          let updated = ApiKeys.recordUsage(apiKey);
           apiKeys.put(key, updated);
           ?updated
         } else { null }
@@ -3796,10 +3388,9 @@ public shared query(msg) func getRemainingGameSlots() : async Nat {
     }
   };
 
-  // Revoke API key
   public shared(msg) func revokeApiKey(gameId : Text) : async Result.Result<Text, Text> {
     let game = switch (games.get(gameId)) {
-      case null { return #err("Game not found"); };
+      case null { return #err("Game not found") };
       case (?g) { g };
     };
     
@@ -3807,35 +3398,21 @@ public shared query(msg) func getRemainingGameSlots() : async Nat {
       return #err("Only the game owner can revoke API keys");
     };
     
-    for ((key, apiKey) in apiKeys.entries()) {
-      if (apiKey.gameId == gameId and apiKey.isActive) {
-        let updated : ApiKey = {
-          key = apiKey.key;
-          gameId = apiKey.gameId;
-          owner = apiKey.owner;
-          created = apiKey.created;
-          lastUsed = apiKey.lastUsed;
-          tier = apiKey.tier;
-          requestsToday = apiKey.requestsToday;
-          isActive = false;
-        };
-        apiKeys.put(key, updated);
-        
+    switch (ApiKeys.revokeForGame(apiKeys, gameId)) {
+      case (?(key, revokedKey)) {
+        apiKeys.put(key, revokedKey);
         trackEventInternal(#principal(msg.caller), gameId, "api_key_revoked", [
           ("gameId", gameId)
         ]);
-        
-        return #ok("API key revoked");
+        #ok("API key revoked")
       };
-    };
-    
-    #err("No active API key found")
+      case null { #err("No active API key found") };
+    }
   };
 
-  // Update API key tier (owner or admin)
   public shared(msg) func updateApiKeyTier(gameId : Text, newTier : Text) : async Result.Result<Text, Text> {
     let game = switch (games.get(gameId)) {
-      case null { return #err("Game not found"); };
+      case null { return #err("Game not found") };
       case (?g) { g };
     };
     
@@ -3843,30 +3420,119 @@ public shared query(msg) func getRemainingGameSlots() : async Nat {
       return #err("Only the game owner can update API key tier");
     };
     
-    // Validate tier
-    if (newTier != "free" and newTier != "indie" and newTier != "pro") {
+    if (not ApiKeys.isValidTier(newTier)) {
       return #err("Invalid tier. Use: free, indie, or pro");
     };
     
-    for ((key, apiKey) in apiKeys.entries()) {
-      if (apiKey.gameId == gameId and apiKey.isActive) {
-        let updated : ApiKey = {
-          key = apiKey.key;
-          gameId = apiKey.gameId;
-          owner = apiKey.owner;
-          created = apiKey.created;
-          lastUsed = Time.now();
-          tier = newTier;
-          requestsToday = apiKey.requestsToday;
-          isActive = apiKey.isActive;
-        };
-        apiKeys.put(key, updated);
-        return #ok("Tier updated to " # newTier);
+    switch (ApiKeys.updateTierForGame(apiKeys, gameId, newTier)) {
+      case (?(key, updatedKey)) {
+        apiKeys.put(key, updatedKey);
+        #ok("Tier updated to " # newTier)
       };
-    };
-    
-    #err("No active API key found")
+      case null { #err("No active API key found") };
+    }
   };
+
+  // ═══════════════════════════════════════════════════════════════════════════════
+// API KEY BY SESSION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+public shared func generateApiKeyBySession(
+    sessionId: Text,
+    gameId: Text
+) : async Result.Result<Text, Text> {
+    switch (getOwnerFromSession(sessionId)) {
+        case (#err(e)) { return #err(e) };
+        case (#ok(owner)) {
+            switch (games.get(gameId)) {
+                case null { return #err("Game not found") };
+                case (?game) {
+                    if (not Principal.equal(game.owner, owner)) {
+                        return #err("You don't own this game");
+                    };
+                    
+                    if (ApiKeys.hasActiveKey(apiKeys, gameId)) {
+                        return #err("Active API key exists. Revoke it first to generate a new one.");
+                    };
+                    
+                    let newKey = ApiKeys.createKey(gameId, owner);
+                    apiKeys.put(newKey.key, newKey);
+                    
+                    #ok(newKey.key)
+                };
+            };
+        };
+    };
+};
+
+public query func getApiKeyBySession(sessionId: Text, gameId: Text) : async Result.Result<Text, Text> {
+    switch (sessions.get(sessionId)) {
+        case null { return #err("Invalid session") };
+        case (?session) {
+            let owner = emailToPrincipalSimple(session.email);
+            
+            switch (games.get(gameId)) {
+                case null { return #err("Game not found") };
+                case (?game) {
+                    if (not Principal.equal(game.owner, owner)) {
+                        return #err("You don't own this game");
+                    };
+                    
+                    switch (ApiKeys.getActiveKey(apiKeys, gameId)) {
+                        case (?key) { #ok(key) };
+                        case null { #err("No API key found. Generate one first.") };
+                    }
+                };
+            };
+        };
+    };
+};
+
+public query func hasApiKeyBySession(sessionId: Text, gameId: Text) : async Bool {
+    switch (sessions.get(sessionId)) {
+        case null { return false };
+        case (?session) {
+            let owner = emailToPrincipalSimple(session.email);
+            
+            switch (games.get(gameId)) {
+                case null { return false };
+                case (?game) {
+                    if (not Principal.equal(game.owner, owner)) {
+                        return false;
+                    };
+                    ApiKeys.hasActiveKey(apiKeys, gameId)
+                };
+            };
+        };
+    };
+};
+
+public shared func revokeApiKeyBySession(
+    sessionId: Text,
+    gameId: Text
+) : async Result.Result<Text, Text> {
+    switch (getOwnerFromSession(sessionId)) {
+        case (#err(e)) { return #err(e) };
+        case (#ok(owner)) {
+            switch (games.get(gameId)) {
+                case null { return #err("Game not found") };
+                case (?game) {
+                    if (not Principal.equal(game.owner, owner)) {
+                        return #err("You don't own this game");
+                    };
+                    
+                    switch (ApiKeys.revokeForGame(apiKeys, gameId)) {
+                        case (?(key, revokedKey)) {
+                            apiKeys.put(key, revokedKey);
+                            #ok("API key revoked successfully")
+                        };
+                        case null { #err("No active API key found") };
+                    }
+                };
+            };
+        };
+    };
+};
 
   // ════════════════════════════════════════════════════════════════════════════
   // AUTHENTICATION
@@ -5291,36 +4957,6 @@ public shared query(msg) func getRemainingGameSlots() : async Nat {
   // SCOREBOARDS - Developer-configured time-based leaderboards
   // ════════════════════════════════════════════════════════════════════════════
 
-  // Helper: Generate scoreboard key
-  private func makeScoreboardKey(gameId : Text, scoreboardId : Text) : Text {
-    gameId # ":" # scoreboardId
-  };
-
-  // Helper: Check if a scoreboard needs reset based on its period
-  private func scoreboardNeedsReset(config : ScoreboardConfig) : Bool {
-    let currentTime = now();
-    let lastReset = config.lastReset;
-    
-    switch (config.period) {
-      case (#allTime) { false };
-      case (#custom) { false };  // Manual reset only
-      case (#daily) {
-        // Reset if we're on a different day (86400 seconds = 1 day in nanoseconds)
-        let daysSinceReset = (currentTime - lastReset) / 86_400_000_000_000;
-        daysSinceReset >= 1
-      };
-      case (#weekly) {
-        // Reset if 7+ days have passed
-        let daysSinceReset = (currentTime - lastReset) / 86_400_000_000_000;
-        daysSinceReset >= 7
-      };
-      case (#monthly) {
-        // Reset if 30+ days have passed (simplified)
-        let daysSinceReset = (currentTime - lastReset) / 86_400_000_000_000;
-        daysSinceReset >= 30
-      };
-    }
-  };
 
   // Helper: Reset a scoreboard
   private func resetScoreboard(key : Text, config : ScoreboardConfig) : () {
@@ -5343,30 +4979,6 @@ public shared query(msg) func getRemainingGameSlots() : async Nat {
     scoreboardEntries.put(key, Buffer.Buffer<ScoreEntry>(100));
     cachedScoreboards.delete(key);
   };
-
-  // Helper: Convert period to text
-  private func periodToText(period : ScoreboardPeriod) : Text {
-    switch (period) {
-      case (#allTime) { "allTime" };
-      case (#daily) { "daily" };
-      case (#weekly) { "weekly" };
-      case (#monthly) { "monthly" };
-      case (#custom) { "custom" };
-    }
-  };
-
-  // Helper: Text to period
-  private func textToPeriod(text : Text) : ?ScoreboardPeriod {
-    switch (text) {
-      case ("allTime") { ?#allTime };
-      case ("daily") { ?#daily };
-      case ("weekly") { ?#weekly };
-      case ("monthly") { ?#monthly };
-      case ("custom") { ?#custom };
-      case (_) { null };
-    }
-  };
-
 
   // ═══════════════════════════════════════════════════════════════════════════════
   // CREATE SCOREBOARD (Developer function)
@@ -6422,84 +6034,40 @@ public shared query(msg) func getRemainingGameSlots() : async Nat {
     Buffer.toArray(events)
   };
 
-  // ════════════════════════════════════════════════════════════════════════════
+    // ════════════════════════════════════════════════════════════════════════════
   // FILE MANAGEMENT
   // ════════════════════════════════════════════════════════════════════════════
 
   public shared func uploadFile(filename : Text, data : Blob) : async Result.Result<Text, Text> {
-    if (Blob.toArray(data).size() > MAX_FILE_SIZE) {
-      return #err("File too large. Max size: 5MB");
-    };
-    
-    if (List.size(files) >= MAX_FILES) {
-      return #err("File limit reached. Max files: " # Nat.toText(MAX_FILES));
-    };
-    
-    var found = false;
-    let newFiles = List.map<(Text, Blob), (Text, Blob)>(
-      files,
-      func (f : (Text, Blob)) : (Text, Blob) {
-        if (f.0 == filename) {
-          found := true;
-          (filename, data)
-        } else {
-          f
-        }
-      }
-    );
-    
-    if (found) {
-      files := newFiles;
-      #ok("File updated: " # filename)
-    } else {
-      files := List.push((filename, data), files);
-      #ok("File uploaded: " # filename)
-    }
+    let result = Files.upload(files, filename, data);
+    files := result.files;
+    result.result
   };
 
   public shared func deleteFile(filename : Text) : async Result.Result<Text, Text> {
-    let newFiles = List.filter<(Text, Blob)>(
-      files,
-      func (f : (Text, Blob)) : Bool { f.0 != filename }
-    );
-    
-    if (List.size(newFiles) == List.size(files)) {
-      #err("File not found: " # filename)
-    } else {
-      files := newFiles;
-      #ok("File deleted: " # filename)
-    }
+    let result = Files.delete(files, filename);
+    files := result.files;
+    result.result
   };
 
   public query func listFiles() : async [Text] {
-    List.toArray(
-      List.map<(Text, Blob), Text>(
-        files,
-        func(tup : (Text, Blob)) : Text { tup.0 }
-      )
-    )
+    Files.list(files)
   };
 
   public query func getFile(filename : Text) : async ?Blob {
-    let found = List.find<(Text, Blob)>(
-      files,
-      func(tup : (Text, Blob)) : Bool { tup.0 == filename }
-    );
-    switch (found) {
-      case null null;
-      case (?(_, blob)) ?blob;
-    }
+    Files.get(files, filename)
   };
 
   public query func getFileInfo(filename : Text) : async ?{ name: Text; size: Nat } {
-    let found = List.find<(Text, Blob)>(
-      files,
-      func(tup : (Text, Blob)) : Bool { tup.0 == filename }
-    );
-    switch (found) {
-      case null null;
-      case (?(name, blob)) ?{ name = name; size = Blob.toArray(blob).size() };
-    }
+    Files.getInfo(files, filename)
+  };
+
+  public query func getFileCount() : async Nat {
+    Files.count(files)
+  };
+
+  public query func getTotalStorageUsed() : async Nat {
+    Files.totalSize(files)
   };
 
   // ════════════════════════════════════════════════════════════════════════════
@@ -6565,11 +6133,78 @@ public shared query(msg) func getRemainingGameSlots() : async Nat {
     
     let result = switch (command) {
       
-      case ("removeUser") {
+      case ("lookupUser") {
+        if (not hasPermission(msg.caller, #Support)) {
+          #err("🔒 Permission denied: Support role required")
+        } else if (args.size() < 1) {
+          #err("Usage: lookupUser <searchTerm>\nSearches by nickname, email key, or player ID")
+        } else {
+          let searchTerm = args[0];
+          var found = false;
+          var result = "🔍 LOOKUP: " # searchTerm # "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
+          
+          // Search usersByEmail (includes external and device users)
+          for ((key, user) in usersByEmail.entries()) {
+            // Match by key or nickname
+            if (key == searchTerm or 
+                key == "ext:" # searchTerm or
+                user.nickname == searchTerm or
+                Text.contains(key, #text searchTerm)) {
+              found := true;
+              let keyType = if (Text.startsWith(key, #text "ext:")) {
+                "external"
+              } else if (Text.startsWith(key, #text "dev_")) {
+                "device"
+              } else {
+                "email"
+              };
+              result := result # "\n📧 Found in usersByEmail:\n" #
+                       "  Key: " # key # "\n" #
+                       "  Type: " # keyType # "\n" #
+                       "  Nickname: " # user.nickname # "\n" #
+                       "  Auth: " # debug_show(user.authType) # "\n" #
+                       "  Created: " # Nat64.toText(user.created) # "\n" #
+                       "  ─────────────────────────────\n" #
+                       "  To remove: removeUser " # keyType # " " # 
+                       (if (keyType == "external") { Text.trimStart(key, #text "ext:") } else { key }) # "\n";
+            };
+          };
+          
+          // Search usersByPrincipal
+          for ((principal, user) in usersByPrincipal.entries()) {
+            let principalText = Principal.toText(principal);
+            if (principalText == searchTerm or 
+                user.nickname == searchTerm or
+                Text.contains(principalText, #text searchTerm)) {
+              found := true;
+              result := result # "\n🔑 Found in usersByPrincipal:\n" #
+                       "  Principal: " # principalText # "\n" #
+                       "  Nickname: " # user.nickname # "\n" #
+                       "  Auth: " # debug_show(user.authType) # "\n" #
+                       "  Created: " # Nat64.toText(user.created) # "\n" #
+                       "  ─────────────────────────────\n" #
+                       "  To remove: removeUser principal " # principalText # "\n";
+            };
+          };
+          
+          if (found) {
+            #ok(result)
+          } else {
+            #err("❌ No user found matching: " # searchTerm # "\n" #
+                 "Try searching by:\n" #
+                 "  - Exact email/key\n" #
+                 "  - Player ID (dev_...)\n" #
+                 "  - Nickname\n" #
+                 "  - Partial match")
+          }
+        }
+      };
+
+            case ("removeUser") {
         if (not hasPermission(msg.caller, #Moderator)) {
           #err("🔒 Permission denied: Moderator role required")
         } else if (args.size() < 2) {
-          #err("Usage: removeUser <type> <id>")
+          #err("Usage: removeUser <type> <id>\nTypes: email, principal, external, device")
         } else {
           let userType = args[0];
           let userId = args[1];
@@ -6579,6 +6214,25 @@ public shared query(msg) func getRemainingGameSlots() : async Nat {
               switch (usersByEmail.remove(userId)) {
                 case (?_) true;
                 case null false;
+              }
+            };
+            case ("external") {
+              // External auth users (Google/Apple) stored with ext: prefix
+              switch (usersByEmail.remove("ext:" # userId)) {
+                case (?_) true;
+                case null false;
+              }
+            };
+            case ("device") {
+              // Anonymous device users - try both with and without ext: prefix
+              switch (usersByEmail.remove(userId)) {
+                case (?_) true;
+                case null {
+                  switch (usersByEmail.remove("ext:" # userId)) {
+                    case (?_) true;
+                    case null false;
+                  }
+                };
               }
             };
             case ("principal") {
@@ -6592,16 +6246,94 @@ public shared query(msg) func getRemainingGameSlots() : async Nat {
                 case null false;
               }
             };
-            case (_) false;
+            case (_) {
+              return #err("Invalid type. Use: email, principal, external, device")
+            };
           };
           
           if (removed) {
             #ok("✅ User removed successfully.")
           } else {
-            #err("⚠️ User not found.")
+            #err("⚠️ User not found. Try 'lookupByNickname' to find the correct ID/type.")
           }
         }
       };
+
+            case ("banUser") {
+        if (not hasPermission(msg.caller, #Moderator)) {
+          #err("🔒 Permission denied: Moderator role required")
+        } else if (args.size() < 2) {
+          #err("Usage: banUser <type> <id> [reason]\nType: email, principal, external, device")
+        } else {
+          let userType = args[0];
+          let userId = args[1];
+          let reason = if (args.size() >= 3) { args[2] } else { "Cheating" };
+          
+          // First, log the ban in suspicion log for record
+          logSuspicion(userId # "/" # userType, "SYSTEM", "BANNED: " # reason);
+          
+          // Remove from user storage
+          let removed = switch (userType) {
+            case ("email") { 
+              switch (usersByEmail.remove(userId)) {
+                case (?_) true;
+                case null false;
+              }
+            };
+            case ("external") {
+              switch (usersByEmail.remove("ext:" # userId)) {
+                case (?_) true;
+                case null false;
+              }
+            };
+            case ("device") {
+              switch (usersByEmail.remove(userId)) {
+                case (?_) true;
+                case null {
+                  switch (usersByEmail.remove("ext:" # userId)) {
+                    case (?_) true;
+                    case null false;
+                  }
+                };
+              }
+            };
+            case ("principal") {
+              let principal = try {
+                Principal.fromText(userId)
+              } catch (_) {
+                return #err("Invalid principal format");
+              };
+              switch (usersByPrincipal.remove(principal)) {
+                case (?_) true;
+                case null false;
+              }
+            };
+            case (_) {
+              return #err("Invalid type. Use: email, principal, external, device")
+            };
+          };
+          
+          // Always purge from scoreboards (even if user account not found,
+          // they might still have scoreboard entries)
+          let scoreboardsRemoved = purgePlayerFromScoreboards(userType, userId, null);
+          
+          if (removed or scoreboardsRemoved > 0) {
+            #ok("🔨 USER BANNED\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" #
+                "User: " # userId # "\n" #
+                "Type: " # userType # "\n" #
+                "Reason: " # reason # "\n" #
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" #
+                "Account removed: " # (if (removed) "✅" else "⚠️ Not found") # "\n" #
+                "Scoreboard entries removed: " # Nat.toText(scoreboardsRemoved) # "\n" #
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" #
+                "✅ User purged from all leaderboards")
+          } else {
+            #err("⚠️ User not found: " # userId # "\n" #
+                 "💡 Use lookupUser to find the correct ID and type")
+          }
+        }
+      };
+
       
       case ("deleteUser") {
         if (not hasPermission(msg.caller, #Moderator)) {
@@ -7883,6 +7615,139 @@ case ("adminRecoverGame") {
     }
 };
 
+case ("removeFromScoreboards") {
+        if (not hasPermission(msg.caller, #Moderator)) {
+          #err("🔒 Permission denied: Moderator role required")
+        } else if (args.size() < 2) {
+          #err("Usage: removeFromScoreboards <type> <id> [gameId]\n" #
+               "Types: email, principal, external, device, nickname\n" #
+               "If gameId is omitted, removes from ALL games.\n\n" #
+               "Examples:\n" #
+               "  removeFromScoreboards device dev_1769650794_62d0dfcb\n" #
+               "  removeFromScoreboards nickname Player_6970\n" #
+               "  removeFromScoreboards external player_310413122 cheese-match")
+        } else {
+          let searchType = args[0];
+          let searchValue = args[1];
+          let gameFilter : ?Text = if (args.size() >= 3) { ?args[2] } else { null };
+          
+          var removedCount : Nat = 0;
+          var boardsChecked : Nat = 0;
+          var boardsAffected : Nat = 0;
+          
+          for ((sbKey, entriesBuffer) in scoreboardEntries.entries()) {
+            // If game filter specified, check key starts with gameId
+            let shouldCheck = switch (gameFilter) {
+              case (?gId) { Text.startsWith(sbKey, #text (gId # ":")) };
+              case null { true };
+            };
+            
+            if (shouldCheck) {
+              boardsChecked += 1;
+              
+              // Find matching entries to remove
+              let newBuffer = Buffer.Buffer<ScoreEntry>(entriesBuffer.size());
+              var foundInThisBoard = false;
+              
+              for (entry in entriesBuffer.vals()) {
+                let shouldRemove = switch (searchType) {
+                  case ("nickname") {
+                    entry.nickname == searchValue
+                  };
+                  case ("device") {
+                    // Device users stored as #email("ext:dev_xxx") or #email("dev_xxx")
+                    switch (entry.odentifier) {
+                      case (#email(e)) { 
+                        e == searchValue or 
+                        e == "ext:" # searchValue or
+                        Text.contains(e, #text searchValue)
+                      };
+                      case (#principal(_)) { false };
+                    }
+                  };
+                  case ("external") {
+                    switch (entry.odentifier) {
+                      case (#email(e)) { e == "ext:" # searchValue };
+                      case (#principal(_)) { false };
+                    }
+                  };
+                  case ("email") {
+                    switch (entry.odentifier) {
+                      case (#email(e)) { e == searchValue };
+                      case (#principal(_)) { false };
+                    }
+                  };
+                  case ("principal") {
+                    switch (entry.odentifier) {
+                      case (#principal(p)) { Principal.toText(p) == searchValue };
+                      case (#email(_)) { false };
+                    }
+                  };
+                  case (_) { false };
+                };
+                
+                if (shouldRemove) {
+                  removedCount += 1;
+                  foundInThisBoard := true;
+                  // Don't add to new buffer (effectively removing it)
+                } else {
+                  newBuffer.add(entry);
+                };
+              };
+              
+              // If entries were removed, update the buffer and invalidate cache
+              if (foundInThisBoard) {
+                boardsAffected += 1;
+                scoreboardEntries.put(sbKey, newBuffer);
+                cachedScoreboards.delete(sbKey);
+                scoreboardLastUpdate.delete(sbKey);
+              };
+            };
+          };
+          
+          // Also clear legacy leaderboard caches
+          switch (gameFilter) {
+            case (?gId) {
+              cachedLeaderboards.delete(gId # ":score");
+              cachedLeaderboards.delete(gId # ":streak");
+              leaderboardLastUpdate.delete(gId # ":score");
+              leaderboardLastUpdate.delete(gId # ":streak");
+            };
+            case null {
+              // Clear all legacy caches if no game filter
+              for ((key, _) in cachedLeaderboards.entries()) {
+                cachedLeaderboards.delete(key);
+              };
+              for ((key, _) in leaderboardLastUpdate.entries()) {
+                leaderboardLastUpdate.delete(key);
+              };
+            };
+          };
+          
+          if (removedCount > 0) {
+            let scopeText = switch (gameFilter) {
+              case (?gId) { "game: " # gId };
+              case null { "ALL games" };
+            };
+            
+            #ok("🧹 SCOREBOARD CLEANUP\n" #
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" #
+                "Search: " # searchType # " = " # searchValue # "\n" #
+                "Scope: " # scopeText # "\n" #
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" #
+                "Entries removed: " # Nat.toText(removedCount) # "\n" #
+                "Boards checked: " # Nat.toText(boardsChecked) # "\n" #
+                "Boards affected: " # Nat.toText(boardsAffected) # "\n" #
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" #
+                "✅ Caches invalidated - changes visible immediately")
+          } else {
+            #err("⚠️ No entries found matching: " # searchType # " = " # searchValue # "\n" #
+                 "💡 Try 'nickname' type to search by display name\n" #
+                 "💡 Use lookupUser to find the correct identifier")
+          }
+        }
+      };
+
 case ("listDeletedGames") {
     if (not hasPermission(msg.caller, #Support)) {
         #err("🔒 Permission denied: Support role required")
@@ -8233,19 +8098,6 @@ private func isValidGameId(gameId: Text) : Bool {
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// HELPER: Generate unique API key (no external deps)
-// ═══════════════════════════════════════════════════════════════════════════════
-
-private func generateUniqueApiKey(gameId: Text) : Text {
-    let timestamp = Int.toText(Time.now());
-    let combined = gameId # "_" # timestamp;
-    let hash = Text.hash(combined);
-    "cb_" # gameId # "_" # Nat32.toText(hash)
-};
-
-
-
-// ═══════════════════════════════════════════════════════════════════════════════
 // GET GAMES BY SESSION
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -8329,7 +8181,6 @@ public query func getDeletedGamesBySession(sessionId: Text) : async [DeletedGame
     };
 };
 
-
 // ═══════════════════════════════════════════════════════════════════════════════
 // GET REMAINING DELETE ATTEMPTS BY SESSION
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -8344,158 +8195,73 @@ public query func getRemainingDeleteAttemptsBySession(sessionId: Text) : async N
     };
 };
 
-
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// GENERATE API KEY BY SESSION
-// ═══════════════════════════════════════════════════════════════════════════════
-
-public shared func generateApiKeyBySession(
-    sessionId: Text,
-    gameId: Text
-) : async Result.Result<Text, Text> {
+private func purgePlayerFromScoreboards(searchType: Text, searchValue: Text, gameFilter: ?Text) : Nat {
+    var removedCount : Nat = 0;
     
-    switch (getOwnerFromSession(sessionId)) {
-        case (#err(e)) { return #err(e) };
-        case (#ok(owner)) {
-            switch (games.get(gameId)) {
-                case null { return #err("Game not found") };
-                case (?game) {
-                    if (not Principal.equal(game.owner, owner)) {
-                        return #err("You don't own this game");
-                    };
-                    
-                    // Check if active key already exists for this game
-                    for ((_, apiKey) in apiKeys.entries()) {
-                        if (apiKey.gameId == gameId and apiKey.isActive) {
-                            return #err("Active API key exists. Revoke it first to generate a new one.");
-                        };
-                    };
-                    
-                    let key = generateUniqueApiKey(gameId);
-                    let currentTime = Time.now();
-                    
-                    let apiKeyRecord : ApiKey = {
-                        key = key;
-                        gameId = gameId;
-                        owner = owner;
-                        created = currentTime;
-                        lastUsed = currentTime;
-                        tier = "free";
-                        requestsToday = 0;
-                        isActive = true;
-                    };
-                    
-                    apiKeys.put(key, apiKeyRecord);
-                    
-                    #ok(key)
-                };
+    for ((sbKey, entriesBuffer) in scoreboardEntries.entries()) {
+      let shouldCheck = switch (gameFilter) {
+        case (?gId) { Text.startsWith(sbKey, #text (gId # ":")) };
+        case null { true };
+      };
+      
+      if (shouldCheck) {
+        let newBuffer = Buffer.Buffer<ScoreEntry>(entriesBuffer.size());
+        var foundInThisBoard = false;
+        
+        for (entry in entriesBuffer.vals()) {
+          let shouldRemove = switch (searchType) {
+            case ("nickname") {
+              entry.nickname == searchValue
             };
-        };
-    };
-};
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// GET API KEY BY SESSION
-// ═══════════════════════════════════════════════════════════════════════════════
-
-public query func getApiKeyBySession(sessionId: Text, gameId: Text) : async Result.Result<Text, Text> {
-    switch (sessions.get(sessionId)) {
-        case null { return #err("Invalid session") };
-        case (?session) {
-            let owner = emailToPrincipalSimple(session.email);
-            
-            switch (games.get(gameId)) {
-                case null { return #err("Game not found") };
-                case (?game) {
-                    if (not Principal.equal(game.owner, owner)) {
-                        return #err("You don't own this game");
-                    };
-                    
-                    for ((key, apiKey) in apiKeys.entries()) {
-                        if (apiKey.gameId == gameId and apiKey.isActive) {
-                            return #ok(key);
-                        };
-                    };
-                    
-                    #err("No API key found. Generate one first.")
+            case ("device") {
+              switch (entry.odentifier) {
+                case (#email(e)) { 
+                  e == searchValue or 
+                  e == "ext:" # searchValue or
+                  Text.contains(e, #text searchValue)
                 };
+                case (#principal(_)) { false };
+              }
             };
-        };
-    };
-};
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// HAS API KEY BY SESSION
-// ═══════════════════════════════════════════════════════════════════════════════
-
-public query func hasApiKeyBySession(sessionId: Text, gameId: Text) : async Bool {
-    switch (sessions.get(sessionId)) {
-        case null { return false };
-        case (?session) {
-            let owner = emailToPrincipalSimple(session.email);
-            
-            switch (games.get(gameId)) {
-                case null { return false };
-                case (?game) {
-                    if (not Principal.equal(game.owner, owner)) {
-                        return false;
-                    };
-                    
-                    for ((_, apiKey) in apiKeys.entries()) {
-                        if (apiKey.gameId == gameId and apiKey.isActive) {
-                            return true;
-                        };
-                    };
-                    
-                    false
-                };
+            case ("external") {
+              switch (entry.odentifier) {
+                case (#email(e)) { e == "ext:" # searchValue };
+                case (#principal(_)) { false };
+              }
             };
+            case ("email") {
+              switch (entry.odentifier) {
+                case (#email(e)) { e == searchValue };
+                case (#principal(_)) { false };
+              }
+            };
+            case ("principal") {
+              switch (entry.odentifier) {
+                case (#principal(p)) { Principal.toText(p) == searchValue };
+                case (#email(_)) { false };
+              }
+            };
+            case (_) { false };
+          };
+          
+          if (shouldRemove) {
+            removedCount += 1;
+            foundInThisBoard := true;
+          } else {
+            newBuffer.add(entry);
+          };
         };
+        
+        if (foundInThisBoard) {
+          scoreboardEntries.put(sbKey, newBuffer);
+          cachedScoreboards.delete(sbKey);
+          scoreboardLastUpdate.delete(sbKey);
+        };
+      };
     };
-};
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// REVOKE API KEY BY SESSION
-// ═══════════════════════════════════════════════════════════════════════════════
-
-public shared func revokeApiKeyBySession(
-    sessionId: Text,
-    gameId: Text
-) : async Result.Result<Text, Text> {
     
-    switch (getOwnerFromSession(sessionId)) {
-        case (#err(e)) { return #err(e) };
-        case (#ok(owner)) {
-            switch (games.get(gameId)) {
-                case null { return #err("Game not found") };
-                case (?game) {
-                    if (not Principal.equal(game.owner, owner)) {
-                        return #err("You don't own this game");
-                    };
-                    
-                    for ((key, apiKey) in apiKeys.entries()) {
-                        if (apiKey.gameId == gameId and apiKey.isActive) {
-                            let revokedKey : ApiKey = {
-                                key = apiKey.key;
-                                gameId = apiKey.gameId;
-                                owner = apiKey.owner;
-                                created = apiKey.created;
-                                lastUsed = apiKey.lastUsed;
-                                tier = apiKey.tier;
-                                requestsToday = apiKey.requestsToday;
-                                isActive = false;
-                            };
-                            apiKeys.put(key, revokedKey);
-                            return #ok("API key revoked successfully");
-                        };
-                    };
-                    
-                    #err("No active API key found")
-                };
-            };
-        };
-    };
+    removedCount
 };
+
 
 }
