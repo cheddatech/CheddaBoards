@@ -4,7 +4,6 @@
 
 Permanent, serverless leaderboards, achievements, and player profiles — powered by the Internet Computer.
 
-[![Live Demo](https://img.shields.io/badge/demo-Chedz%20vs%20the%20Graters-yellow)](https://cheddagames.com/chedzvsthegraters)
 [![Website](https://img.shields.io/badge/website-cheddaboards.com-blue)](https://cheddaboards.com)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
@@ -12,76 +11,82 @@ Permanent, serverless leaderboards, achievements, and player profiles — powere
 
 ## What's in this repo?
 
-This is the **backend** for CheddaBoards:
+This is the **backend canister** for CheddaBoards — the on-chain logic that powers everything:
 
 | Component | Description |
 |-----------|-------------|
-| `src/main.mo` | Motoko canister — all game logic, leaderboards, auth, achievements |
-| `netlify/functions/api.js` | REST API proxy — HTTP interface to the canister |
-| `netlify/functions/auth-verify.ts` | OAuth verifier — validates Google/Apple tokens |
+| `src/main.mo` | Motoko canister — game logic, leaderboards, auth, achievements, anti-cheat |
+| `src/cheddaboards.did` | Candid interface — the full API contract |
+
+The canister runs on the Internet Computer and stores all data permanently on-chain. No database, no server, no infrastructure to manage.
 
 **Looking for SDKs?**
-- [cheddaboards-godot](https://github.com/cheddatech/cheddaboards-godot) — Godot 4 plugin
-- cheddaboards-js — Web SDK (coming soon)
+- [CheddaBoards-Godot](https://github.com/cheddatech/CheddaBoards-Godot) — Godot 4 SDK (also on the Godot Asset Library)
+- CheddaBoards-Unity — Unity C# SDK (coming soon)
 
 ---
 
 ## Architecture
 
 ```
-┌─────────────────┐      ┌─────────────────┐      ┌─────────────────┐
-│   Your Game     │──────│  Netlify Edge   │──────│   ICP Canister  │
-│  (Godot/Web)    │      │  (api.js)       │      │   (main.mo)     │
-└─────────────────┘      └─────────────────┘      └─────────────────┘
-                                │
-                         ┌──────┴──────┐
-                         │ auth-verify │
-                         │ (OAuth JWT) │
-                         └─────────────┘
+┌─────────────────┐      ┌─────────────────┐
+│   Your Game     │──────│   ICP Canister   │
+│ (Godot/Unity/   │ HTTP │   (main.mo)      │
+│  Web/Native)    │──────│                  │
+└─────────────────┘      └──────────────────┘
 ```
 
-- **Note:** REST API currently runs on Netlify. HTTP canister planned for future release.
+The canister handles authentication, score validation, leaderboard management, achievements, and player profiles. Games communicate via the CheddaBoards SDK, which talks to the canister through a REST API layer.
 
-- **Canister**: Stores all data permanently on ICP. No database to manage.
-- **API Proxy**: Translates REST to canister calls. Handles OAuth verification.
-- **Auth Verifier**: Validates Google/Apple JWTs, creates sessions via trusted identity.
+---
+
+## Features
+
+- **Multi-Auth**: Google, Apple, Internet Identity, Anonymous, Device Code (RFC 8628)
+- **Leaderboards**: Real-time, server-validated scores
+- **Scoreboards**: Daily/weekly/monthly with automatic archiving
+- **Achievements**: Unlock tracking with timestamps
+- **Anti-Cheat**: Rate limiting, score caps, play session time validation, shadowbans
+- **Cross-Game Profiles**: Players keep one identity across all CheddaBoards games
+- **Per-Game OAuth**: Developers register their own Google/Apple credentials
+- **Account Migration**: Upgrade anonymous accounts to verified without losing data
 
 ---
 
 ## Self-Hosting
 
+Want to run your own instance? The canister is fully open-source.
+
 ### Prerequisites
 
 - [dfx](https://internetcomputer.org/docs/current/developer-docs/setup/install/) (IC SDK)
-- [Node.js](https://nodejs.org/) 18+
-- [Netlify CLI](https://docs.netlify.com/cli/get-started/) (optional, for functions)
+- Basic familiarity with Motoko and the Internet Computer
 
 ### 1. Clone & Install
 
 ```bash
 git clone https://github.com/cheddatech/cheddaboards.git
 cd cheddaboards
-npm install
 ```
 
 ### 2. Configure Principals
 
-Edit `src/main.mo` and replace the placeholder principals:
+Edit `src/main.mo` and replace the placeholder principals with your own:
 
 ```motoko
-// Line ~414 - OAuth token verifier identity
+// OAuth token verifier identity
 let VERIFIER : Principal = Principal.fromText("your-verifier-principal");
 
-// Line ~501 - Super admin (your dfx identity)  
+// Super admin (your dfx identity)
 private var CONTROLLER : Principal = Principal.fromText("your-controller-principal");
 
-// Line ~2263 - Initial admin (can be same as controller)
+// Initial admin (can be same as controller)
 let firstAdmin = Principal.fromText("your-admin-principal");
 ```
 
-Get your principal: `dfx identity get-principal`
+Get your principal with: `dfx identity get-principal`
 
-### 3. Deploy Canister
+### 3. Deploy
 
 ```bash
 # Local testing
@@ -96,75 +101,44 @@ dfx deploy --network ic
 
 ```bash
 dfx generate cheddaboards
-cp .dfx/local/canisters/cheddaboards/cheddaboards.did.js netlify/functions/_lib/
 ```
 
-### 5. Configure Netlify Functions
-
-Copy `.env.example` to `.env` and fill in your values:
-
-```bash
-cp .env.example .env
-```
-
-Required variables:
-- `CANISTER_ID` — Your deployed canister ID
-- `VERIFIER_IDENTITY_JSON` — Ed25519 identity JSON (must match VERIFIER principal)
-- `GOOGLE_CLIENT_ID` — From Google Cloud Console
-- `APPLE_SERVICE_ID` / `APPLE_BUNDLE_ID` — From Apple Developer Portal
-- `ALLOWED_ORIGINS` — Your game domains (comma-separated)
-
-### 6. Deploy Functions
-
-```bash
-netlify deploy --prod
-```
-
-Or connect your repo to Netlify for automatic deploys.
+You'll need to build your own API layer to translate REST/HTTP requests into canister calls. The Candid interface defines all available methods and their signatures.
 
 ---
 
 ## Using the Hosted Version
 
-Don't want to self-host? Use our hosted infrastructure:
-
-```javascript
-// Web SDK
-const chedda = await CheddaBoards.init(null, { gameId: 'your-game' });
-```
+Don't want to self-host? Use our hosted infrastructure at [cheddaboards.com](https://cheddaboards.com):
 
 ```gdscript
-# Godot
+# Godot — 3-minute setup
 var chedda = CheddaBoards.new()
-chedda.init("your-game-id")
+chedda.game_id = "your-game-id"
+chedda.set_api_key("your-api-key")
 ```
 
 **Free tier**: 3 games, unlimited players.
 
----
-
-## Features
-
-- **Multi-Auth**: Google, Apple, Internet Identity, Anonymous
-- **Leaderboards**: Real-time, server-validated scores
-- **Scoreboards**: Daily/weekly/monthly with automatic archives
-- **Achievements**: Unlock tracking with timestamps
-- **Anti-Cheat**: Rate limiting, score validation, play session verification
-- **Cross-Game Profiles**: Players keep one identity across all CheddaBoards games
+See the [documentation](https://cheddaboards.com/docs) for setup guides and API reference.
 
 ---
 
-## API Endpoints
+## API Reference
 
-See `/api/docs` for full documentation. Key endpoints:
+The Candid interface (`cheddaboards.did`) defines the full canister API. Key methods:
 
-```
-POST /api/auth/google          # Sign in with Google
-POST /api/auth/apple           # Sign in with Apple
-POST /api/scores               # Submit score
-GET  /api/games/:id/scoreboards/:id  # Get leaderboard
-POST /api/achievements         # Unlock achievement
-```
+**Authentication**: `socialLoginAndGetProfile`, `anonymousLoginAndGetProfile`, `createSessionForVerifiedUser`, `validateSession`, `destroySession`
+
+**Scores & Leaderboards**: `submitScore`, `getScoreboard`, `getLeaderboard`, `getPlayerRank`
+
+**Scoreboards**: `createScoreboardBySession`, `resetScoreboardBySession`, `getScoreboardArchives`, `getLastArchivedScoreboard`
+
+**Achievements**: `unlockAchievement`, `getAchievements`
+
+**Play Sessions**: `startGameSessionByApiKey`, `startGameSessionBySession`, `getPlaySessionStatus`
+
+**Profiles**: `getMyProfileBySession`, `getUserProfile`, `changeNicknameAndGetProfile`
 
 ---
 
@@ -182,9 +156,10 @@ Contributions welcome! This is open source because gaming infrastructure should 
 ## Links
 
 - **Website**: [cheddaboards.com](https://cheddaboards.com)
-- **Demo**: [Chedz vs the Graters](https://cheddagames.com/chedzvsthegraters)
+- **Games**: [chedda.games](https://chedda.games)
 - **Company**: [cheddatech.com](https://cheddatech.com)
-- **Twitter**: [@cheddatech](https://twitter.com/cheddatech)
+- **X**: [@cheddatech](https://x.com/cheddatech)
+
 ---
 
 ## License
