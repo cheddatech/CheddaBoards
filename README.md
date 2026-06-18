@@ -21,8 +21,10 @@ This is the **backend canister** for CheddaBoards — the on-chain logic that po
 The canister runs on the Internet Computer and stores all data permanently on-chain. No database, no server, no infrastructure to manage.
 
 **Looking for SDKs?**
-- [CheddaBoards-Godot](https://github.com/cheddatech/CheddaBoards-Godot) — Godot 4 SDK (also on the Godot Asset Library)
-- CheddaBoards-Unity — Unity C# SDK (coming soon)
+- [CheddaBoards-Godot](https://github.com/cheddatech/CheddaBoards-Godot) — Godot 4 **and** Godot 3.6 SDK (also on the Godot Asset Library)
+- [CheddaBoards-Unity](https://github.com/cheddatech/CheddaBoards-Unity) — Unity C# SDK
+
+All three SDKs talk to the same REST API, so anything that can make HTTP requests works too — Unreal, GameMaker, native mobile, web, or your own engine.
 
 ---
 
@@ -36,7 +38,7 @@ The canister runs on the Internet Computer and stores all data permanently on-ch
 └─────────────────┘      └──────────────────┘
 ```
 
-The canister handles authentication, score validation, leaderboard management, achievements, and player profiles. Games communicate via the CheddaBoards SDK, which talks to the canister through a REST API layer.
+The canister handles authentication, score validation, leaderboard management, achievements, and player profiles. Games communicate via a CheddaBoards SDK (or raw HTTP), which reaches the canister through a thin REST API layer.
 
 ---
 
@@ -44,7 +46,8 @@ The canister handles authentication, score validation, leaderboard management, a
 
 - **Multi-Auth**: Google, Apple, Internet Identity, Anonymous, Device Code (RFC 8628)
 - **Leaderboards**: Real-time, server-validated scores
-- **Scoreboards**: Daily/weekly/monthly with automatic archiving
+- **Timed Scoreboards**: Daily / weekly / monthly / custom-interval boards with automatic archiving
+- **Category Scoreboards**: Targeted per-level, per-mode, or per-category boards — submit to one specific board by ID, without registering a separate game for each
 - **Achievements**: Unlock tracking with timestamps
 - **Anti-Cheat**: Rate limiting, score caps, play session time validation, shadowbans
 - **Cross-Game Profiles**: Players keep one identity across all CheddaBoards games
@@ -71,17 +74,17 @@ cd cheddaboards
 
 ### 2. Configure Principals
 
-Edit `src/main.mo` and replace the placeholder principals with your own:
+Open `src/main.mo` and replace the placeholder principals (`aaaaa-aa`) with your own:
 
 ```motoko
-// OAuth token verifier identity
-let VERIFIER : Principal = Principal.fromText("your-verifier-principal");
+// OAuth token verifier identity — REPLACE with your own
+let VERIFIER : Principal = Principal.fromText("aaaaa-aa");
 
-// Super admin (your dfx identity)
-private var CONTROLLER : Principal = Principal.fromText("your-controller-principal");
+// Super admin (your dfx identity) — REPLACE with your own
+private var CONTROLLER : Principal = Principal.fromText("aaaaa-aa");
 
-// Initial admin (can be same as controller)
-let firstAdmin = Principal.fromText("your-admin-principal");
+// Initial admin (can be the same as controller) — REPLACE with your own
+let firstAdmin = Principal.fromText("aaaaa-aa");
 ```
 
 Get your principal with: `dfx identity get-principal`
@@ -109,18 +112,18 @@ You'll need to build your own API layer to translate REST/HTTP requests into can
 
 ## Using the Hosted Version
 
-Don't want to self-host? Use our hosted infrastructure at [cheddaboards.com](https://cheddaboards.com):
+Don't want to self-host? Use our hosted infrastructure at [cheddaboards.com](https://cheddaboards.com). Add the SDK as an autoload, then:
 
 ```gdscript
 # Godot — 3-minute setup
-var chedda = CheddaBoards.new()
-chedda.game_id = "your-game-id"
-chedda.set_api_key("your-api-key")
+CheddaBoards.set_api_key("your-api-key")
+CheddaBoards.set_game_id("your-game-id")
+CheddaBoards.login_anonymous("PlayerName")
 ```
 
 **Free tier**: 3 games, unlimited players.
 
-See the [documentation](https://cheddaboards.com/docs) for setup guides and API reference.
+See the [documentation](https://github.com/cheddatech/CheddaBoards-Godot/tree/main/docs) for setup guides and API reference. (It's hosted in the Godot SDK repo for now, and will move to the site.)
 
 ---
 
@@ -130,15 +133,19 @@ The Candid interface (`cheddaboards.did`) defines the full canister API. Key met
 
 **Authentication**: `socialLoginAndGetProfile`, `anonymousLoginAndGetProfile`, `createSessionForVerifiedUser`, `validateSession`, `destroySession`
 
-**Scores & Leaderboards**: `submitScore`, `getScoreboard`, `getLeaderboard`, `getPlayerRank`
+**Scores & Leaderboards**: `submitScore`, `submitScoreToBoard`, `getScoreboard`, `getLeaderboard`, `getPlayerRank`
 
-**Scoreboards**: `createScoreboardBySession`, `resetScoreboardBySession`, `getScoreboardArchives`, `getLastArchivedScoreboard`
+**Scoreboard Management**: `createScoreboard`, `updateScoreboard`, `resetScoreboard`, `deleteScoreboard` (principal-based), plus `createScoreboardBySession` / `resetScoreboardBySession` for session auth
+
+**Archives**: `getScoreboardArchives`, `getLastArchivedScoreboard`
 
 **Achievements**: `unlockAchievement`, `getAchievements`
 
 **Play Sessions**: `startGameSessionByApiKey`, `startGameSessionBySession`, `getPlaySessionStatus`
 
 **Profiles**: `getMyProfileBySession`, `getUserProfile`, `changeNicknameAndGetProfile`
+
+> **Fan-out vs targeted:** `submitScore` fans a score out to every standard board on the game (all-time, weekly, daily…). `submitScoreToBoard` writes to one board only — used for the per-level / per-category boards above. A board opts in to the targeted behaviour in its config.
 
 ---
 
@@ -156,6 +163,7 @@ Contributions welcome! This is open source because gaming infrastructure should 
 ## Links
 
 - **Website**: [cheddaboards.com](https://cheddaboards.com)
+- **Docs**: [Godot SDK repo → /docs](https://github.com/cheddatech/CheddaBoards-Godot/tree/main/docs)
 - **Games**: [chedda.games](https://chedda.games)
 - **Company**: [cheddatech.com](https://cheddatech.com)
 - **X**: [@cheddatech](https://x.com/cheddatech)
