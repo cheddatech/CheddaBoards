@@ -227,7 +227,7 @@ module {
     #daily;     // Resets daily at midnight UTC
     #weekly;    // Resets weekly on Monday midnight UTC
     #monthly;   // Resets on 1st of each month
-    #custom;    // Manual reset by developer
+    #custom;    // Configurable cadence: never, or every N (see ScoreboardConfig.resetIntervalNanos)
   };
 
   /// Scoreboard configuration (set by developer)
@@ -242,6 +242,9 @@ module {
     created : Nat64;
     lastReset : Nat64;
     isActive : Bool;
+    // Both OPTIONAL so existing persisted configs upgrade cleanly (old data → null).
+    targeted : ?Bool;             // ?true = targeted-only (category) board; null/?false = fan-out
+    resetIntervalNanos : ?Nat64;  // when period == #custom: reset every N nanos; null = never
   };
 
   /// Individual score entry (internal - includes identifier)
