@@ -1,11 +1,18 @@
 // main.mo - CheddaBoards Backend
-
-//     SETUP REQUIRED: Search for "REPLACE WITH YOUR" and set:
-//     - VERIFIER: Your OAuth token verifier canister principal
-//     - CONTROLLER: Your super admin principal (usually your dfx identity)
-//     - firstAdmin: Initial admin principal (can be same as CONTROLLER)
 //
-// See README for deployment instructions.
+// SETUP REQUIRED before deploying:
+//   Search this file for "REPLACE WITH YOUR" and set each one. Until you do,
+//   they default to the management-canister principal ("aaaaa-aa") - a valid,
+//   non-functional placeholder that no user controls, so nobody has admin and
+//   OAuth verification stays inert. Safe to compile and deploy, but configure
+//   these before relying on it.
+//
+//     - VERIFIER   : your OAuth token-verifier canister principal
+//     - CONTROLLER : your super-admin principal
+//                    (usually your dfx identity: `dfx identity get-principal`)
+//     - firstAdmin : your initial admin principal (can equal CONTROLLER)
+//
+// See README for full deployment instructions.
 
 import HashMap "mo:base/HashMap";
 import Principal "mo:base/Principal";
@@ -26,6 +33,7 @@ import Int "mo:base/Int";
 import Nat32 "mo:base/Nat32";
 import Error "mo:base/Error";
 import Char "mo:base/Char";
+import Timer "mo:base/Timer";
 
 import Types "types";
 import Files "files";
@@ -104,8 +112,8 @@ persistent actor CheddaBoards {
   // CONSTANTS
   // ════════════════════════════════════════════════════════════════════════════
 
-  // TODO: Set via deployment - this is your OAuth token verifier canister
-  let VERIFIER : Principal = Principal.fromText("aaaaa-aa"); // REPLACE WITH YOUR VERIFIER PRINCIPAL
+  // REPLACE WITH YOUR OAuth verifier canister principal (placeholder = management canister, non-functional)
+  let VERIFIER : Principal = Principal.fromText("aaaaa-aa");
   
   // ════════════════════════════════════════════════════════════════════════════
   // STABLE STORAGE
@@ -154,7 +162,9 @@ persistent actor CheddaBoards {
 
   // ════════════════════════════════════════════════════════════════════════════
   // RUNTIME MAPS
-  // ════════════════════════════════════════════════════════════════════════════
+  // ════════════════════════════════════════════════════════════════════════════  
+  
+  private transient var scoreboardTimerId : ?Timer.TimerId = null;
   private transient var alternativeOrigins = Buffer.Buffer<Text>(10);
   private transient var deletedGames = HashMap.HashMap<Text, DeletedGame>(10, Text.equal, Text.hash);
   private transient var deleteRateLimit = HashMap.HashMap<Principal, [DeletionAttempt]>(10, Principal.equal, Principal.hash);
@@ -193,8 +203,9 @@ persistent actor CheddaBoards {
   // CONSTANTS
   // ════════════════════════════════════════════════════════════════════════════
 
-  // TODO: Set via deployment - this is the super admin principal
-  private var CONTROLLER : Principal = Principal.fromText("aaaaa-aa"); // REPLACE WITH YOUR CONTROLLER PRINCIPAL
+  // REPLACE WITH YOUR super-admin principal - usually your dfx identity (`dfx identity get-principal`).
+  // Placeholder is the management canister, which no user controls, so no one has admin until you set this.
+  private var CONTROLLER : Principal = Principal.fromText("aaaaa-aa");
   private transient let SESSION_DURATION_NS : Nat64 = 24 * 60 * 60 * 1_000_000_000;
   private transient var lastCleanup : Nat64 = 0;
   private transient let MAX_GAMES_PER_DEVELOPER : Nat = 3;
@@ -424,6 +435,30 @@ private func getDeveloperTierText(owner: Principal) : Text {
     }
   };
 
+    private func getPeriodDuration(config : ScoreboardConfig) : ?Nat64 {
+      switch (config.period) {
+        case (#daily)   { ?Scoreboards.DAY_IN_NANOS };
+        case (#weekly)  { ?Scoreboards.WEEK_IN_NANOS };
+        case (#monthly) { ?Scoreboards.MONTH_IN_NANOS };
+        case (#allTime) { null };
+        case (#custom)  { config.resetIntervalNanos };  // every-N, or null = never
+      }
+    };
+
+    private func calculateCurrentPeriodStart(config : ScoreboardConfig, currentTime : Nat64) : Nat64 {
+      switch (getPeriodDuration(config)) {
+        case null { config.lastReset }; // allTime, or custom with no interval - no-op
+        case (?duration) {
+          if (duration == 0) { return config.lastReset };
+          var boundary = config.lastReset;
+          while (boundary + duration <= currentTime) {
+            boundary += duration;
+          };
+          boundary
+        };
+      }
+    };
+
   // ════════════════════════════════════════════════════════════════════════════
   // PLAYER HELPERS (delegated to Players module)
   // ════════════════════════════════════════════════════════════════════════════
@@ -452,6 +487,56 @@ private func getDeveloperTierText(owner: Principal) : Text {
       usersByEmail.entries(),
       usersByPrincipal.entries()
     )
+  };
+
+  // Get an available nickname - adds _1, _2, etc. if the base name is taken
+  private func getAvailableNickname(desiredNickname : Text, excludeIdentifier : ?UserIdentifier) : Text {
+    // If the desired nickname is available, use it
+    if (not isNicknameTaken(desiredNickname, excludeIdentifier)) {
+      return desiredNickname;
+    };
+    
+    // Try with suffixes: _1, _2, _3, etc.
+    // Max 12 chars total, so we need to truncate if adding suffix would exceed
+    var suffix : Nat = 1;
+    let maxSuffix : Nat = 99;
+    
+    while (suffix <= maxSuffix) {
+      let suffixText = "_" # Nat.toText(suffix);
+      let suffixLen = Text.size(suffixText);
+      
+      // Truncate base name if needed to fit within 12 chars
+      let maxBaseLen = 12 - suffixLen;
+      var baseName = desiredNickname;
+      if (Text.size(baseName) > maxBaseLen) {
+        // Take first maxBaseLen chars
+        var chars = Buffer.Buffer<Char>(maxBaseLen);
+        var count = 0;
+        for (c in baseName.chars()) {
+          if (count < maxBaseLen) {
+            chars.add(c);
+            count += 1;
+          };
+        };
+        baseName := Text.fromIter(chars.vals());
+      };
+      
+      let candidate = baseName # suffixText;
+      
+      if (not isNicknameTaken(candidate, excludeIdentifier)) {
+        return candidate;
+      };
+      
+      suffix += 1;
+    };
+    
+    // Fallback: generate a random name (very unlikely to reach here)
+    "Player_" # Nat.toText(userIdCounter)
+  };
+
+  // Check if a nickname is available (public query for frontend)
+  public query func isNicknameAvailable(nickname : Text, gameId : Text) : async Bool {
+    not isNicknameTaken(nickname, null)
   };
 
   private func looksLikeEmail(text : Text) : Bool {
@@ -754,7 +839,7 @@ private func getDeveloperTierText(owner: Principal) : Text {
   // HELPER: Create default scoreboards for a new game
   // ═══════════════════════════════════════════════════════════════════════════════
   
-  private func createDefaultScoreboards(gameId : Text, owner : Principal) : () {
+private func createDefaultScoreboards(gameId : Text, owner : Principal) : () {
     let currentTime = now();
     
     // Create All-Time scoreboard (by score)
@@ -766,10 +851,12 @@ private func getDeveloperTierText(owner: Principal) : Text {
       description = "Best scores of all time";
       period = #allTime;
       sortBy = #score;
-      maxEntries = 100;
+      maxEntries = 1000;
       created = currentTime;
       lastReset = currentTime;
       isActive = true;
+      targeted = ?false;
+      resetIntervalNanos = null;
     };
     scoreboardConfigs.put(allTimeKey, allTimeConfig);
     scoreboardEntries.put(allTimeKey, Buffer.Buffer<ScoreEntry>(100));
@@ -783,16 +870,37 @@ private func getDeveloperTierText(owner: Principal) : Text {
       description = "Top scores this week";
       period = #weekly;
       sortBy = #score;
-      maxEntries = 100;
+      maxEntries = 1000;
       created = currentTime;
       lastReset = currentTime;
       isActive = true;
+      targeted = ?false;
+      resetIntervalNanos = null;
     };
     scoreboardConfigs.put(weeklyKey, weeklyConfig);
     scoreboardEntries.put(weeklyKey, Buffer.Buffer<ScoreEntry>(100));
     
+    // Create Daily scoreboard (by score)
+    let dailyKey = makeScoreboardKey(gameId, "daily");
+    let dailyConfig : ScoreboardConfig = {
+      scoreboardId = "daily";
+      gameId = gameId;
+      name = "Daily";
+      description = "Top scores today";
+      period = #daily;
+      sortBy = #score;
+      maxEntries = 1000;
+      created = currentTime;
+      lastReset = currentTime;
+      isActive = true;
+      targeted = ?false;
+      resetIntervalNanos = null;
+    };
+    scoreboardConfigs.put(dailyKey, dailyConfig);
+    scoreboardEntries.put(dailyKey, Buffer.Buffer<ScoreEntry>(100));
+    
     trackEventInternal(#principal(owner), gameId, "default_scoreboards_created", [
-      ("scoreboards", "all-time,weekly")
+      ("scoreboards", "all-time,weekly,daily")
     ]);
   };
 
@@ -830,6 +938,131 @@ private func getDeveloperTierText(owner: Principal) : Text {
     };
   };
 
+
+  // Writes one player's best-merged entry into a SINGLE scoreboard buffer.
+  // Extracted from updateScoreboardsForGame so the fan-out path and the targeted
+  // submitScoreToBoard path share identical reset/merge/trim/cache semantics.
+  private func writeEntryToBoard(
+    sbKey : Text,
+    config : ScoreboardConfig,
+    userIdentifier : UserIdentifier,
+    nickname : Text,
+    score : Nat64,
+    streak : Nat64,
+    authType : AuthType,
+    t : Nat64
+  ) {
+    // Auto-reset if due (interval-aware for #custom via Scoreboards.needsReset)
+    let needsReset = Scoreboards.needsReset(config, t);
+
+    var entriesBuffer = switch (scoreboardEntries.get(sbKey)) {
+      case (?buf) { buf };
+      case null { Buffer.Buffer<ScoreEntry>(config.maxEntries) };
+    };
+
+    if (needsReset) {
+      archiveScoreboard(sbKey, config);
+      entriesBuffer := Buffer.Buffer<ScoreEntry>(config.maxEntries);
+      scoreboardConfigs.put(sbKey, {
+        scoreboardId = config.scoreboardId;
+        gameId = config.gameId;
+        name = config.name;
+        description = config.description;
+        period = config.period;
+        sortBy = config.sortBy;
+        maxEntries = config.maxEntries;
+        created = config.created;
+        lastReset = t;
+        isActive = config.isActive;
+        targeted = config.targeted;
+        resetIntervalNanos = config.resetIntervalNanos;
+      });
+    };
+
+    var existingEntry : ?ScoreEntry = null;
+    var existingIdx : ?Nat = null;
+    var idx : Nat = 0;
+    for (entry in entriesBuffer.vals()) {
+      if (identifiersEqual(entry.odentifier, userIdentifier)) {
+        existingEntry := ?entry;
+        existingIdx := ?idx;
+      };
+      idx += 1;
+    };
+
+    let existingScore : Nat64 = switch (existingEntry) { case null { 0 }; case (?e) { e.score } };
+    let existingStreak : Nat64 = switch (existingEntry) { case null { 0 }; case (?e) { e.streak } };
+
+    let mergedScore : Nat64 = if (score > existingScore) score else existingScore;
+    let mergedStreak : Nat64 = if (streak > existingStreak) streak else existingStreak;
+
+    let scoreImproved = score > existingScore;
+    let streakImproved = streak > existingStreak;
+    let nicknameChanged = switch (existingEntry) { case null { false }; case (?e) { e.nickname != nickname } };
+    let isNewEntry = existingEntry == null;
+    let shouldWrite = isNewEntry or scoreImproved or streakImproved or nicknameChanged;
+
+    let sortImproved = switch (config.sortBy) {
+      case (#score) { scoreImproved };
+      case (#streak) { streakImproved };
+    };
+
+    if (shouldWrite) {
+      let newSubmittedAt = if (sortImproved or isNewEntry) { t }
+                           else {
+                             switch (existingEntry) {
+                               case (?e) { e.submittedAt };
+                               case null { t };
+                             };
+                           };
+
+      let newEntry : ScoreEntry = {
+        odentifier = userIdentifier;
+        nickname = nickname;
+        score = mergedScore;
+        streak = mergedStreak;
+        submittedAt = newSubmittedAt;
+        authType = authType;
+      };
+
+      switch (existingIdx) {
+        case (?i) { entriesBuffer.put(i, newEntry) };
+        case null {
+          entriesBuffer.add(newEntry);
+          if (entriesBuffer.size() > config.maxEntries) {
+            var worstIdx : Nat = 0;
+            var worstValue : Nat64 = switch (config.sortBy) {
+              case (#score) { entriesBuffer.get(0).score };
+              case (#streak) { entriesBuffer.get(0).streak };
+            };
+            var i : Nat = 1;
+            while (i < entriesBuffer.size()) {
+              let entryValue = switch (config.sortBy) {
+                case (#score) { entriesBuffer.get(i).score };
+                case (#streak) { entriesBuffer.get(i).streak };
+              };
+              if (entryValue < worstValue) {
+                worstValue := entryValue;
+                worstIdx := i;
+              };
+              i += 1;
+            };
+            let newBuffer = Buffer.Buffer<ScoreEntry>(config.maxEntries);
+            i := 0;
+            for (entry in entriesBuffer.vals()) {
+              if (i != worstIdx) { newBuffer.add(entry) };
+              i += 1;
+            };
+            entriesBuffer := newBuffer;
+          };
+        };
+      };
+
+      scoreboardEntries.put(sbKey, entriesBuffer);
+      cachedScoreboards.delete(sbKey);
+      scoreboardLastUpdate.delete(sbKey);
+    };
+  };
 
  private func updateScoreboardsForGame(
     gameId : Text,
@@ -889,35 +1122,43 @@ private func getDeveloperTierText(owner: Principal) : Text {
       case null {};
     };
     
-    // Iterate through all scoreboard configs
+    // Fan-out to this game's NON-targeted boards. Targeted (category) boards are
+    // written only via submitScoreToBoard, so a plain submit never pollutes them.
     for ((sbKey, config) in scoreboardConfigs.entries()) {
-      // Only process scoreboards for this game
-      if (config.gameId == gameId and config.isActive) {
-        
-        // Check if scoreboard needs auto-reset
-        let needsReset = switch (config.period) {
-          case (#daily) { shouldResetDaily(config.lastReset, t) };
-          case (#weekly) { shouldResetWeekly(config.lastReset, t) };
-          case (#monthly) { shouldResetMonthly(config.lastReset, t) };
-          case (#allTime) { false };
-          case (#custom) { false };
-        };
-        
-        // Get or create entries buffer
-        var entriesBuffer = switch (scoreboardEntries.get(sbKey)) {
-          case (?buf) { buf };
-          case null { Buffer.Buffer<ScoreEntry>(config.maxEntries) };
-        };
-      
-        if (needsReset) {
-          // Archive the current period before clearing
-          archiveScoreboard(sbKey, config);
+      let isTargeted = config.targeted == ?true;
+      if (config.gameId == gameId and config.isActive and not isTargeted) {
+        writeEntryToBoard(sbKey, config, userIdentifier, nickname, score, streak, authType, t);
+      };
+    };
+  };
+
+  private func sweepExpiredScoreboards() : async () {
+  let t = now();
+  
+  for ((key, config) in scoreboardConfigs.entries()) {
+    // Skip boards that don't have timed periods
+    switch (config.period) {
+      case (#allTime) {};
+      case (_) {
+        // Check if this board's period has elapsed
+        if (Scoreboards.needsReset(config, t)) {
           
-          // Clear entries for new period
-          entriesBuffer := Buffer.Buffer<ScoreEntry>(config.maxEntries);
+          // Only archive if there are actual entries
+          let hasEntries = switch (scoreboardEntries.get(key)) {
+            case (?buf) { buf.size() > 0 };
+            case null { false };
+          };
           
-          // Update config with new lastReset timestamp
-          scoreboardConfigs.put(sbKey, {
+          if (hasEntries) {
+            archiveScoreboard(key, config);
+          };
+          
+          // Snap lastReset to the start of the CURRENT period
+          // (skips over any empty intermediate periods)
+          let newPeriodStart = calculateCurrentPeriodStart(config, t);
+          
+          // Update config
+          scoreboardConfigs.put(key, {
             scoreboardId = config.scoreboardId;
             gameId = config.gameId;
             name = config.name;
@@ -926,134 +1167,23 @@ private func getDeveloperTierText(owner: Principal) : Text {
             sortBy = config.sortBy;
             maxEntries = config.maxEntries;
             created = config.created;
-            lastReset = t;
+            lastReset = newPeriodStart;
             isActive = config.isActive;
+            targeted = config.targeted;
+            resetIntervalNanos = config.resetIntervalNanos;
           });
-        };
-        
-        // Get the value we're comparing (score or streak based on sortBy)
-        let newValue = switch (config.sortBy) {
-          case (#score) { score };
-          case (#streak) { streak };
-        };
-        
-        // Find existing entry for this user (if any) - O(n) pass
-        var existingEntry : ?ScoreEntry = null;
-        var existingIdx : ?Nat = null;
-        var idx : Nat = 0;
-        
-        for (entry in entriesBuffer.vals()) {
-          if (identifiersEqual(entry.odentifier, userIdentifier)) {
-            existingEntry := ?entry;
-            existingIdx := ?idx;
-          };
-          idx += 1;
-        };
-        
-        // Determine if we should update
-        let existingValue = switch (existingEntry) {
-          case null { 0 : Nat64 };
-          case (?existing) {
-            switch (config.sortBy) {
-              case (#score) { existing.score };
-              case (#streak) { existing.streak };
-            };
-          };
-        };
-        
-        let shouldUpdate = switch (existingEntry) {
-          case null { true };  // No existing entry, always add
-          case (?_) { newValue > existingValue };
-        };
-        
-        let finalValue = if (shouldUpdate) { newValue } else { existingValue };
-        
-        if (shouldUpdate) {
-          // Create new/updated entry
-          let newEntry : ScoreEntry = {
-            odentifier = userIdentifier;
-            nickname = nickname;
-            score = if (shouldUpdate) score else (switch (existingEntry) { case (?e) e.score; case null score });
-            streak = if (shouldUpdate) streak else (switch (existingEntry) { case (?e) e.streak; case null streak });
-            submittedAt = t;
-            authType = authType;
-          };
           
-          switch (existingIdx) {
-            case (?i) {
-              // Update in place - O(1)
-              entriesBuffer.put(i, newEntry);
-            };
-            case null {
-              // New entry - add it
-              entriesBuffer.add(newEntry);
-              
-              // If over limit, remove the worst entry - O(n)
-              if (entriesBuffer.size() > config.maxEntries) {
-                var worstIdx : Nat = 0;
-                var worstValue : Nat64 = switch (config.sortBy) {
-                  case (#score) { entriesBuffer.get(0).score };
-                  case (#streak) { entriesBuffer.get(0).streak };
-                };
-                
-                var i : Nat = 1;
-                while (i < entriesBuffer.size()) {
-                  let entryValue = switch (config.sortBy) {
-                    case (#score) { entriesBuffer.get(i).score };
-                    case (#streak) { entriesBuffer.get(i).streak };
-                  };
-                  if (entryValue < worstValue) {
-                    worstValue := entryValue;
-                    worstIdx := i;
-                  };
-                  i += 1;
-                };
-                
-                // Remove worst entry by rebuilding buffer without it - O(n)
-                let newBuffer = Buffer.Buffer<ScoreEntry>(config.maxEntries);
-                i := 0;
-                for (entry in entriesBuffer.vals()) {
-                  if (i != worstIdx) {
-                    newBuffer.add(entry);
-                  };
-                  i += 1;
-                };
-                entriesBuffer := newBuffer;
-              };
-            };
-          };
+          // Clear entries for the new period
+          scoreboardEntries.put(key, Buffer.Buffer<ScoreEntry>(config.maxEntries));
           
-          // Save updated entries
-          scoreboardEntries.put(sbKey, entriesBuffer);
-          
-          // Invalidate cache (will be rebuilt on next read)
-          cachedScoreboards.delete(sbKey);
-          scoreboardLastUpdate.delete(sbKey);
-        } else {
-          // Just update nickname if changed - O(1) update in place
-          switch (existingEntry, existingIdx) {
-            case (?existing, ?i) {
-              if (existing.nickname != nickname) {
-                let updatedEntry : ScoreEntry = {
-                  odentifier = existing.odentifier;
-                  nickname = nickname;
-                  score = existing.score;
-                  streak = existing.streak;
-                  submittedAt = existing.submittedAt;
-                  authType = existing.authType;
-                };
-                entriesBuffer.put(i, updatedEntry);
-                scoreboardEntries.put(sbKey, entriesBuffer);
-                cachedScoreboards.delete(sbKey);
-                scoreboardLastUpdate.delete(sbKey);
-              };
-            };
-            case _ {};
-          };
+          // Bust caches
+          cachedScoreboards.delete(key);
+          scoreboardLastUpdate.delete(key);
         };
       };
     };
   };
+};
 
   // ════════════════════════════════════════════════════════════════════════════
   // VALIDATION - Updated to handle external users
@@ -1572,6 +1702,674 @@ private func getDeveloperTierText(owner: Principal) : Text {
     #ok("Cleaned up " # Nat.toText(count) # " expired games")
   };
 
+  // ═══════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
+// ACCOUNT MIGRATION: Anonymous → Verified (Google/Apple/II)
+// ═══════════════════════════════════════════════════════════════════════════════
+// Flow:
+//   1. Anonymous user plays with device ID (ext:dev_123456_abcdef)
+//   2. User authenticates with Google/Apple → gets a session
+//   3. SDK calls migrateAnonymousAccount(sessionId, deviceId)
+//   4. Backend merges scores, achievements, play counts from anon → verified
+//   5. Updates all scoreboard entries to point to new identity
+//   6. Deletes the anonymous profile
+//
+// Authorization: Caller must have a valid session (proves they authenticated)
+// The device ID is passed as a parameter — only someone on that device would know it
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Build a merged scoreboard entry from an anonymous entry + an existing verified
+// entry, taking per-field maximums so a personal-best streak on anon propagates
+// into the verified entry even if the verified entry has a higher score (and
+// vice versa). Mirrors the submission-time merge at line ~1053 — the old
+// all-or-nothing swap (keepAnon based on score alone) would silently wipe
+// whichever field happened to be lower on the "winning" side.
+//
+// submittedAt tracks whichever field is the board's sortBy, since that's what
+// affects rank ordering and tiebreaks.
+private func mergeScoreEntries(
+  aEntry : ScoreEntry,
+  vEntry : ScoreEntry,
+  newIdentifier : UserIdentifier,
+  newNickname : Text,
+  newAuthType : AuthType,
+  sortBy : SortBy
+) : ScoreEntry {
+  let mergedScore : Nat64 = if (aEntry.score > vEntry.score) aEntry.score else vEntry.score;
+  let mergedStreak : Nat64 = if (aEntry.streak > vEntry.streak) aEntry.streak else vEntry.streak;
+
+  // Pick the submittedAt from whichever source owns the sort-relevant field.
+  // If both are tied on the sort field, prefer the older timestamp to keep
+  // existing rank position (consistent with submission-path tiebreak behaviour).
+  let mergedSubmittedAt : Nat64 = switch (sortBy) {
+    case (#score) {
+      if (aEntry.score > vEntry.score) { aEntry.submittedAt }
+      else if (vEntry.score > aEntry.score) { vEntry.submittedAt }
+      else if (aEntry.submittedAt < vEntry.submittedAt) { aEntry.submittedAt }
+      else { vEntry.submittedAt }
+    };
+    case (#streak) {
+      if (aEntry.streak > vEntry.streak) { aEntry.submittedAt }
+      else if (vEntry.streak > aEntry.streak) { vEntry.submittedAt }
+      else if (aEntry.submittedAt < vEntry.submittedAt) { aEntry.submittedAt }
+      else { vEntry.submittedAt }
+    };
+  };
+
+  {
+    odentifier = newIdentifier;
+    nickname = newNickname;
+    score = mergedScore;
+    streak = mergedStreak;
+    submittedAt = mergedSubmittedAt;
+    authType = newAuthType;
+  };
+};
+
+// Look up a scoreboard's sortBy config, defaulting to #score if config is missing
+// (preserves old behaviour for any scoreboards without explicit config).
+private func scoreboardSortBy(sbKey : Text) : SortBy {
+  switch (scoreboardConfigs.get(sbKey)) {
+    case (?cfg) { cfg.sortBy };
+    case null { #score };
+  };
+};
+
+public shared(msg) func migrateAnonymousAccount(
+  sessionId : Text,
+  deviceId : Text
+) : async Result.Result<{
+  message : Text;
+  migratedGames : Nat;
+  migratedScoreboards : Nat;
+}, Text> {
+
+  // ── Step 1: Validate the session (proves caller is authenticated) ──
+  let session = switch (validateSessionInternal(sessionId)) {
+    case (#err(e)) { return #err("Authentication required: " # e) };
+    case (#ok(s)) { s };
+  };
+
+  let newEmail = session.email;
+  let newIdentifier : UserIdentifier = #email(newEmail);
+
+  // ── Step 2: Find the anonymous user ──
+  let anonKey = "ext:" # deviceId;
+  let anonIdentifier : UserIdentifier = #email(anonKey);
+
+  let anonUser = switch (usersByEmail.get(anonKey)) {
+    case null { return #err("Anonymous account not found for device: " # deviceId) };
+    case (?u) { u };
+  };
+
+  // ── Step 3: Prevent self-migration ──
+  if (anonKey == newEmail) {
+    return #err("Cannot migrate to the same account");
+  };
+
+  // ── Step 4: Get or create the verified user ──
+  let verifiedUser = switch (usersByEmail.get(newEmail)) {
+    case null {
+      // Shouldn't happen if they just logged in, but handle gracefully
+      return #err("Verified account not found. Please login first.");
+    };
+    case (?u) { u };
+  };
+
+  // ── Step 5: Merge game profiles ──
+  // Strategy: For each game the anonymous user played:
+  //   - If verified user also has a profile: take best score, best streak, merge achievements, add play counts
+  //   - If verified user doesn't have it: copy the whole game profile over
+  
+  let mergedProfiles = Buffer.Buffer<(Text, GameProfile)>(
+    verifiedUser.gameProfiles.size() + anonUser.gameProfiles.size()
+  );
+
+  // Start with all verified user's existing profiles
+  var migratedGames : Nat = 0;
+
+  for ((gId, verifiedGP) in verifiedUser.gameProfiles.vals()) {
+    // Check if anon also has a profile for this game
+    var anonGP : ?GameProfile = null;
+    for ((aGId, aGP) in anonUser.gameProfiles.vals()) {
+      if (aGId == gId) {
+        anonGP := ?aGP;
+      };
+    };
+
+    switch (anonGP) {
+      case null {
+        // Verified user has this game but anon doesn't — keep as-is
+        mergedProfiles.add((gId, verifiedGP));
+      };
+      case (?aGP) {
+        // Both have profiles — merge: take best scores, combine achievements
+        migratedGames += 1;
+
+        // Merge achievements (deduplicated)
+        let achievementSet = Buffer.Buffer<Text>(
+          verifiedGP.achievements.size() + aGP.achievements.size()
+        );
+        for (a in verifiedGP.achievements.vals()) {
+          achievementSet.add(a);
+        };
+        for (a in aGP.achievements.vals()) {
+          var exists = false;
+          for (existing in achievementSet.vals()) {
+            if (existing == a) { exists := true };
+          };
+          if (not exists) {
+            achievementSet.add(a);
+          };
+        };
+
+        let merged : GameProfile = {
+          gameId = gId;
+          total_score = if (aGP.total_score > verifiedGP.total_score) { aGP.total_score } else { verifiedGP.total_score };
+          best_streak = if (aGP.best_streak > verifiedGP.best_streak) { aGP.best_streak } else { verifiedGP.best_streak };
+          achievements = Buffer.toArray(achievementSet);
+          last_played = if (aGP.last_played > verifiedGP.last_played) { aGP.last_played } else { verifiedGP.last_played };
+          play_count = verifiedGP.play_count + aGP.play_count;
+        };
+        mergedProfiles.add((gId, merged));
+      };
+    };
+  };
+
+  // Add any games the anon user had that the verified user didn't
+  for ((aGId, aGP) in anonUser.gameProfiles.vals()) {
+    var alreadyMerged = false;
+    for ((gId, _) in verifiedUser.gameProfiles.vals()) {
+      if (gId == aGId) { alreadyMerged := true };
+    };
+    if (not alreadyMerged) {
+      migratedGames += 1;
+      mergedProfiles.add((aGId, aGP));
+    };
+  };
+
+  // ── Step 6: Update scoreboard entries ──
+  // Find all scoreboard entries that reference the anonymous identifier
+  // and update them to point to the verified user
+  var migratedScoreboards : Nat = 0;
+
+  for ((sbKey, entriesBuffer) in scoreboardEntries.entries()) {
+    var modified = false;
+
+    let newBuffer = Buffer.Buffer<ScoreEntry>(entriesBuffer.size());
+
+    // First pass: check if verified user already has an entry in this scoreboard
+    var verifiedEntry : ?ScoreEntry = null;
+    var verifiedIdx : ?Nat = null;
+    var anonEntry : ?ScoreEntry = null;
+    var idx : Nat = 0;
+
+    for (entry in entriesBuffer.vals()) {
+      if (identifiersEqual(entry.odentifier, newIdentifier)) {
+        verifiedEntry := ?entry;
+        verifiedIdx := ?idx;
+      };
+      if (identifiersEqual(entry.odentifier, anonIdentifier)) {
+        anonEntry := ?entry;
+      };
+      idx += 1;
+    };
+
+    switch (anonEntry) {
+      case null {
+        // Anonymous user has no entry in this scoreboard — nothing to do
+      };
+      case (?aEntry) {
+        modified := true;
+        migratedScoreboards += 1;
+
+        switch (verifiedEntry) {
+          case null {
+            // Verified user has no entry — just update the anonymous entry's identifier
+            for (entry in entriesBuffer.vals()) {
+              if (identifiersEqual(entry.odentifier, anonIdentifier)) {
+                let updated : ScoreEntry = {
+                  odentifier = newIdentifier;
+                  nickname = verifiedUser.nickname;
+                  score = entry.score;
+                  streak = entry.streak;
+                  submittedAt = entry.submittedAt;
+                  authType = verifiedUser.authType;
+                };
+                newBuffer.add(updated);
+              } else {
+                newBuffer.add(entry);
+              };
+            };
+          };
+          case (?vEntry) {
+            // Both have entries — merge with per-field maximums under verified
+            // identity, drop the anon entry. Previously this used an all-or-nothing
+            // swap based on score, which silently dropped a higher anon streak
+            // whenever the verified score was higher (and vice versa).
+            let mergedEntry = mergeScoreEntries(
+              aEntry,
+              vEntry,
+              newIdentifier,
+              verifiedUser.nickname,
+              verifiedUser.authType,
+              scoreboardSortBy(sbKey)
+            );
+
+            for (entry in entriesBuffer.vals()) {
+              if (identifiersEqual(entry.odentifier, anonIdentifier)) {
+                // Skip the anonymous entry (merged into the verified one below)
+              } else if (identifiersEqual(entry.odentifier, newIdentifier)) {
+                newBuffer.add(mergedEntry);
+              } else {
+                newBuffer.add(entry);
+              };
+            };
+          };
+        };
+
+        if (modified) {
+          scoreboardEntries.put(sbKey, newBuffer);
+          // Invalidate cache for this scoreboard
+          cachedScoreboards.delete(sbKey);
+          scoreboardLastUpdate.delete(sbKey);
+        };
+      };
+    };
+  };
+
+  // Also invalidate legacy leaderboard caches
+  for ((aGId, _) in anonUser.gameProfiles.vals()) {
+    cachedLeaderboards.delete(aGId # ":score");
+    cachedLeaderboards.delete(aGId # ":streak");
+  };
+
+  // ── Step 7: Save the merged profile ──
+  let t = now();
+  let updatedVerified : UserProfile = {
+    identifier = verifiedUser.identifier;
+    nickname = verifiedUser.nickname;
+    authType = verifiedUser.authType;
+    gameProfiles = Buffer.toArray(mergedProfiles);
+    created = verifiedUser.created;
+    last_updated = t;
+  };
+  usersByEmail.put(newEmail, updatedVerified);
+
+  // ── Step 8: Delete the anonymous profile ──
+  ignore usersByEmail.remove(anonKey);
+
+  // ── Step 9: Clean up any play sessions for the old identity ──
+  let keysToRemove = Buffer.Buffer<Text>(5);
+  for ((token, ps) in playSessions.entries()) {
+    if (identifiersEqual(ps.identifier, anonIdentifier)) {
+      keysToRemove.add(token);
+    };
+  };
+  for (key in keysToRemove.vals()) {
+    playSessions.delete(key);
+  };
+
+  // ── Step 10: Track the migration event ──
+  trackEventInternal(newIdentifier, "system", "account_migrated", [
+    ("from_device", deviceId),
+    ("to_email", newEmail),
+    ("migrated_games", Nat.toText(migratedGames)),
+    ("migrated_scoreboards", Nat.toText(migratedScoreboards)),
+    ("auth_type", authTypeToText(verifiedUser.authType))
+  ]);
+
+  #ok({
+    message = "Account upgraded! " # Nat.toText(migratedGames) # " game(s) and " # Nat.toText(migratedScoreboards) # " scoreboard entries migrated.";
+    migratedGames = migratedGames;
+    migratedScoreboards = migratedScoreboards;
+  })
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ACCOUNT MIGRATION: Anonymous → Internet Identity
+// ═══════════════════════════════════════════════════════════════════════════════
+
+public shared(msg) func migrateAnonymousToII(
+  deviceId : Text
+) : async Result.Result<{
+  message : Text;
+  migratedGames : Nat;
+  migratedScoreboards : Nat;
+}, Text> {
+
+  let caller = msg.caller;
+
+  if (Principal.isAnonymous(caller)) {
+    return #err("Internet Identity authentication required");
+  };
+
+  let newIdentifier : UserIdentifier = #principal(caller);
+
+  // Find the anonymous user
+  let anonKey = "ext:" # deviceId;
+  let anonIdentifier : UserIdentifier = #email(anonKey);
+
+  let anonUser = switch (usersByEmail.get(anonKey)) {
+    case null { return #err("Anonymous account not found for device: " # deviceId) };
+    case (?u) { u };
+  };
+
+  // Get or create II user
+  let iiUser = switch (usersByPrincipal.get(caller)) {
+    case null { return #err("II account not found. Please login with Internet Identity first.") };
+    case (?u) { u };
+  };
+
+  let mergedProfiles = Buffer.Buffer<(Text, GameProfile)>(
+    iiUser.gameProfiles.size() + anonUser.gameProfiles.size()
+  );
+
+  var migratedGames : Nat = 0;
+
+  for ((gId, iiGP) in iiUser.gameProfiles.vals()) {
+    var anonGP : ?GameProfile = null;
+    for ((aGId, aGP) in anonUser.gameProfiles.vals()) {
+      if (aGId == gId) { anonGP := ?aGP };
+    };
+
+    switch (anonGP) {
+      case null { mergedProfiles.add((gId, iiGP)) };
+      case (?aGP) {
+        migratedGames += 1;
+        let achievementSet = Buffer.Buffer<Text>(iiGP.achievements.size() + aGP.achievements.size());
+        for (a in iiGP.achievements.vals()) { achievementSet.add(a) };
+        for (a in aGP.achievements.vals()) {
+          var exists = false;
+          for (existing in achievementSet.vals()) { if (existing == a) { exists := true } };
+          if (not exists) { achievementSet.add(a) };
+        };
+
+        mergedProfiles.add((gId, {
+          gameId = gId;
+          total_score = if (aGP.total_score > iiGP.total_score) { aGP.total_score } else { iiGP.total_score };
+          best_streak = if (aGP.best_streak > iiGP.best_streak) { aGP.best_streak } else { iiGP.best_streak };
+          achievements = Buffer.toArray(achievementSet);
+          last_played = if (aGP.last_played > iiGP.last_played) { aGP.last_played } else { iiGP.last_played };
+          play_count = iiGP.play_count + aGP.play_count;
+        }));
+      };
+    };
+  };
+
+  for ((aGId, aGP) in anonUser.gameProfiles.vals()) {
+    var alreadyMerged = false;
+    for ((gId, _) in iiUser.gameProfiles.vals()) {
+      if (gId == aGId) { alreadyMerged := true };
+    };
+    if (not alreadyMerged) {
+      migratedGames += 1;
+      mergedProfiles.add((aGId, aGP));
+    };
+  };
+
+  // ── Update scoreboard entries ──
+  var migratedScoreboards : Nat = 0;
+
+  for ((sbKey, entriesBuffer) in scoreboardEntries.entries()) {
+    var anonEntry : ?ScoreEntry = null;
+    var iiEntry : ?ScoreEntry = null;
+
+    for (entry in entriesBuffer.vals()) {
+      if (identifiersEqual(entry.odentifier, anonIdentifier)) { anonEntry := ?entry };
+      if (identifiersEqual(entry.odentifier, newIdentifier)) { iiEntry := ?entry };
+    };
+
+    switch (anonEntry) {
+      case null {};
+      case (?aEntry) {
+        migratedScoreboards += 1;
+        let newBuffer = Buffer.Buffer<ScoreEntry>(entriesBuffer.size());
+
+        switch (iiEntry) {
+          case null {
+            for (entry in entriesBuffer.vals()) {
+              if (identifiersEqual(entry.odentifier, anonIdentifier)) {
+                newBuffer.add({
+                  odentifier = newIdentifier;
+                  nickname = iiUser.nickname;
+                  score = entry.score;
+                  streak = entry.streak;
+                  submittedAt = entry.submittedAt;
+                  authType = #internetIdentity;
+                });
+              } else { newBuffer.add(entry) };
+            };
+          };
+          case (?vEntry) {
+            // Per-field-max merge (see mergeScoreEntries). Previously this used
+            // an all-or-nothing swap based on score, which silently dropped a
+            // higher anon streak whenever the II account's score was higher.
+            let mergedEntry = mergeScoreEntries(
+              aEntry,
+              vEntry,
+              newIdentifier,
+              iiUser.nickname,
+              #internetIdentity,
+              scoreboardSortBy(sbKey)
+            );
+            for (entry in entriesBuffer.vals()) {
+              if (identifiersEqual(entry.odentifier, anonIdentifier)) {
+                // skip
+              } else if (identifiersEqual(entry.odentifier, newIdentifier)) {
+                newBuffer.add(mergedEntry);
+              } else { newBuffer.add(entry) };
+            };
+          };
+        };
+
+        scoreboardEntries.put(sbKey, newBuffer);
+        cachedScoreboards.delete(sbKey);
+        scoreboardLastUpdate.delete(sbKey);
+      };
+    };
+  };
+
+  for ((aGId, _) in anonUser.gameProfiles.vals()) {
+    cachedLeaderboards.delete(aGId # ":score");
+    cachedLeaderboards.delete(aGId # ":streak");
+  };
+
+  // ── Save and cleanup ──
+  let t = now();
+  usersByPrincipal.put(caller, {
+    identifier = iiUser.identifier;
+    nickname = iiUser.nickname;
+    authType = iiUser.authType;
+    gameProfiles = Buffer.toArray(mergedProfiles);
+    created = iiUser.created;
+    last_updated = t;
+  });
+
+  ignore usersByEmail.remove(anonKey);
+
+  let keysToRemove = Buffer.Buffer<Text>(5);
+  for ((token, ps) in playSessions.entries()) {
+    if (identifiersEqual(ps.identifier, anonIdentifier)) {
+      keysToRemove.add(token);
+    };
+  };
+  for (key in keysToRemove.vals()) { playSessions.delete(key) };
+
+  trackEventInternal(newIdentifier, "system", "account_migrated_ii", [
+    ("from_device", deviceId),
+    ("to_principal", Principal.toText(caller)),
+    ("migrated_games", Nat.toText(migratedGames)),
+    ("migrated_scoreboards", Nat.toText(migratedScoreboards))
+  ]);
+
+  #ok({
+    message = "Account upgraded to Internet Identity! " # Nat.toText(migratedGames) # " game(s) and " # Nat.toText(migratedScoreboards) # " scoreboard entries migrated.";
+    migratedGames = migratedGames;
+    migratedScoreboards = migratedScoreboards;
+  })
+};
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ADMIN: REPAIR MIGRATED STREAKS (internal helper, exposed via adminGate)
+// ═══════════════════════════════════════════════════════════════════════════════
+// Backfills the pre-fix migration bug where an anonymous-account's personal-best
+// streak was silently dropped during link-account if the verified entry had a
+// higher score. The GameProfile.best_streak merge was always correct, so we use
+// the profile as the source of truth and pull any scoreboard entry's streak up
+// to match. Score cannot be safely repaired this way (GameProfile.total_score is
+// cumulative, not best-run), so only streak is touched.
+//
+// Safe to run multiple times — no-op once all entries match their profile.
+// Call with dryRun=true first to preview without writing.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+private func repairMigratedStreaksInternal(dryRun : Bool) : Text {
+  var scoreboardsScanned : Nat = 0;
+  var entriesScanned : Nat = 0;
+  var entriesRepaired : Nat = 0;
+  var entriesSkippedNoUser : Nat = 0;
+  var entriesSkippedNoProfile : Nat = 0;
+  let details = Buffer.Buffer<Text>(64);
+  let cachesToInvalidate = Buffer.Buffer<Text>(16);
+
+  for ((sbKey, entriesBuffer) in scoreboardEntries.entries()) {
+    scoreboardsScanned += 1;
+
+    // Look up the config to learn which gameId this scoreboard belongs to.
+    // Without a config we can't tell which GameProfile to cross-reference, so skip.
+    let gameId : Text = switch (scoreboardConfigs.get(sbKey)) {
+      case (?cfg) { cfg.gameId };
+      case null { "" };  // sentinel for "skip"
+    };
+    if (gameId == "") {
+      // No config for this scoreboard — can't repair
+    } else {
+      let newBuffer = Buffer.Buffer<ScoreEntry>(entriesBuffer.size());
+      var sbModified = false;
+
+      for (entry in entriesBuffer.vals()) {
+        entriesScanned += 1;
+
+        // Look up the owning user by the entry's identifier
+        switch (getUserByIdentifier(entry.odentifier)) {
+          case null {
+            // User no longer exists (deleted, pruned, etc.) — leave entry alone
+            entriesSkippedNoUser += 1;
+            newBuffer.add(entry);
+          };
+          case (?user) {
+            // Find the GameProfile matching this scoreboard's gameId
+            var profileStreak : ?Nat64 = null;
+            for ((gId, gp) in user.gameProfiles.vals()) {
+              if (gId == gameId) { profileStreak := ?gp.best_streak };
+            };
+
+            switch (profileStreak) {
+              case null {
+                // User has no profile for this game — leave entry alone
+                entriesSkippedNoProfile += 1;
+                newBuffer.add(entry);
+              };
+              case (?bestStreak) {
+                if (bestStreak > entry.streak) {
+                  // This is the repair case: profile knows a higher streak than
+                  // the entry reflects, which only happens if the migration
+                  // merge dropped it.
+                  entriesRepaired += 1;
+                  if (details.size() < 50) {
+                    details.add(
+                      "  • " # gameId # "/" # sbKey # ": " # entry.nickname
+                      # " streak " # Nat64.toText(entry.streak)
+                      # " → " # Nat64.toText(bestStreak)
+                    );
+                  };
+                  sbModified := true;
+                  newBuffer.add({
+                    odentifier = entry.odentifier;
+                    nickname = entry.nickname;
+                    score = entry.score;
+                    streak = bestStreak;
+                    submittedAt = entry.submittedAt;
+                    authType = entry.authType;
+                  });
+                } else {
+                  // Entry already correct (or higher, which shouldn't happen
+                  // but we leave it alone either way)
+                  newBuffer.add(entry);
+                };
+              };
+            };
+          };
+        };
+      };
+
+      if (sbModified and not dryRun) {
+        scoreboardEntries.put(sbKey, newBuffer);
+        cachesToInvalidate.add(sbKey);
+      };
+    };
+  };
+
+  // Invalidate caches for any scoreboards we touched. Only do this on a real
+  // run — a dry-run must not have side effects.
+  if (not dryRun) {
+    for (sbKey in cachesToInvalidate.vals()) {
+      cachedScoreboards.delete(sbKey);
+      scoreboardLastUpdate.delete(sbKey);
+    };
+    // Also invalidate legacy leaderboard caches for any gameIds we touched
+    let touchedGames = Buffer.Buffer<Text>(8);
+    for (sbKey in cachesToInvalidate.vals()) {
+      switch (scoreboardConfigs.get(sbKey)) {
+        case (?cfg) {
+          var seen = false;
+          for (g in touchedGames.vals()) { if (g == cfg.gameId) { seen := true } };
+          if (not seen) { touchedGames.add(cfg.gameId) };
+        };
+        case null {};
+      };
+    };
+    for (gId in touchedGames.vals()) {
+      cachedLeaderboards.delete(gId # ":score");
+      cachedLeaderboards.delete(gId # ":streak");
+    };
+  };
+
+  // Format report
+  let header = if (dryRun) {
+    "🧪 DRY RUN — no changes written\n"
+  } else {
+    "🔧 REPAIR APPLIED\n"
+  };
+  let verb = if (dryRun) { "would repair" } else { "repaired" };
+
+  var report = header
+    # "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    # "Scoreboards scanned:   " # Nat.toText(scoreboardsScanned) # "\n"
+    # "Entries scanned:       " # Nat.toText(entriesScanned) # "\n"
+    # "Entries " # verb # ":  " # Nat.toText(entriesRepaired) # "\n"
+    # "Skipped (no user):     " # Nat.toText(entriesSkippedNoUser) # "\n"
+    # "Skipped (no profile):  " # Nat.toText(entriesSkippedNoProfile) # "\n";
+
+  if (details.size() > 0) {
+    report := report # "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\nChanges";
+    if (entriesRepaired > 50) {
+      report := report # " (first 50 of " # Nat.toText(entriesRepaired) # ")";
+    };
+    report := report # ":\n";
+    for (line in details.vals()) {
+      report := report # line # "\n";
+    };
+  } else {
+    report := report # "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\nNo changes needed — all entries already match their profiles. ✅\n";
+  };
+
+  report
+};
+
+
   // ════════════════════════════════════════════════════════════════════════════
   // UPGRADE HOOKS
   // ════════════════════════════════════════════════════════════════════════════
@@ -1898,9 +2696,21 @@ system func postupgrade() {
     );
     playSessionsStable := [];
 
-     // TODO: Set via deployment - initial admin (can be same as CONTROLLER or different)
-    let firstAdmin = Principal.fromText("aaaaa-aa"); // REPLACE WITH YOUR ADMIN PRINCIPAL
+    // REPLACE WITH YOUR initial admin principal (can be the same as CONTROLLER).
+    let firstAdmin = Principal.fromText("aaaaa-aa");
     adminRoles.put(firstAdmin, #SuperAdmin);
+
+    // Cancel any previous timer (safety for redeployments)
+    switch (scoreboardTimerId) {
+      case (?id) { Timer.cancelTimer(id) };
+      case null {};
+    };
+    
+    // Start recurring sweep - every hour (3600 seconds)
+    scoreboardTimerId := ?Timer.recurringTimer<system>(
+      #seconds(3600),
+      sweepExpiredScoreboards
+    );
 };
 
   // ════════════════════════════════════════════════════════════════════════════
@@ -3706,9 +4516,12 @@ public shared func revokeApiKeyBySession(
         (existingUser, false)
       };
       case null {
+        // For new users, ensure nickname is available (auto-suffix if taken)
+        let availableNickname = getAvailableNickname(nickname, null);
+        
         let newUser : UserProfile = {
           identifier = #email(email);
-          nickname = nickname;
+          nickname = availableNickname;
           authType = authType;
           gameProfiles = [];
           created = now();
@@ -3718,7 +4531,8 @@ public shared func revokeApiKeyBySession(
         
         trackEventInternal(#email(email), "default", "signup", [
           ("provider", provider),
-          ("nickname", nickname)
+          ("nickname", availableNickname),
+          ("requested_nickname", nickname)
         ]);
         
         (newUser, true)
@@ -3894,10 +4708,8 @@ public shared func revokeApiKeyBySession(
       case (_) { return #err("Invalid user type") };
     };
     
-    // Check AFTER identifier is defined
-    if (isNicknameTaken(newNickname, ?identifier)) {
-      return #err("Nickname already taken");
-    };
+    // Get an available nickname (auto-suffix if taken)
+    let finalNickname = getAvailableNickname(newNickname, ?identifier);
     
     let user = getUserByIdentifier(identifier);
     
@@ -3906,7 +4718,7 @@ public shared func revokeApiKeyBySession(
       case (?u) {
         let updatedUser : UserProfile = {
           identifier = u.identifier;
-          nickname = newNickname;
+          nickname = finalNickname;
           authType = u.authType;
           gameProfiles = u.gameProfiles;
           created = u.created;
@@ -3917,8 +4729,73 @@ public shared func revokeApiKeyBySession(
         
         trackEventInternal(u.identifier, "default", "nickname_changed", [
           ("old_nickname", u.nickname),
-          ("new_nickname", newNickname)
+          ("new_nickname", finalNickname),
+          ("requested_nickname", newNickname)
         ]);
+        
+        // ── Propagate nickname to all scoreboard entries ──
+        if (u.nickname != finalNickname) {
+          for ((sbKey, entriesBuffer) in scoreboardEntries.entries()) {
+            var found = false;
+            var foundIdx : Nat = 0;
+            var idx : Nat = 0;
+            
+            for (entry in entriesBuffer.vals()) {
+              if (identifiersEqual(entry.odentifier, identifier)) {
+                found := true;
+                foundIdx := idx;
+              };
+              idx += 1;
+            };
+            
+            if (found) {
+              let existing = entriesBuffer.get(foundIdx);
+              let updated : ScoreEntry = {
+                odentifier = existing.odentifier;
+                nickname = finalNickname;
+                score = existing.score;
+                streak = existing.streak;
+                submittedAt = existing.submittedAt;
+                authType = existing.authType;
+              };
+              entriesBuffer.put(foundIdx, updated);
+              scoreboardEntries.put(sbKey, entriesBuffer);
+              cachedScoreboards.delete(sbKey);
+              scoreboardLastUpdate.delete(sbKey);
+            };
+          };
+          
+          // Also invalidate legacy leaderboard caches for user's games
+          for ((gId, _) in u.gameProfiles.vals()) {
+            cachedLeaderboards.delete(gId # ":score");
+            cachedLeaderboards.delete(gId # ":streak");
+          };
+          
+          // ── Propagate nickname to active sessions ──
+          let userEmail = switch (identifier) {
+            case (#email(e)) { ?e };
+            case (_) { null };
+          };
+          switch (userEmail) {
+            case (?email) {
+              for ((sid, sess) in sessions.entries()) {
+                if (sess.email == email) {
+                  let updatedSession : Session = {
+                    sessionId = sess.sessionId;
+                    email = sess.email;
+                    nickname = finalNickname;
+                    authType = sess.authType;
+                    created = sess.created;
+                    expires = sess.expires;
+                    lastUsed = sess.lastUsed;
+                  };
+                  sessions.put(sid, updatedSession);
+                };
+              };
+            };
+            case null {};
+          };
+        };
         
         var gameProfile : ?{
           total_score : Nat64;
@@ -3940,9 +4817,15 @@ public shared func revokeApiKeyBySession(
           };
         };
         
+        let message = if (finalNickname == newNickname) {
+          "Nickname changed to " # finalNickname
+        } else {
+          "Nickname '" # newNickname # "' was taken, changed to " # finalNickname
+        };
+        
         #ok({
-          message = "Nickname changed to " # newNickname;
-          nickname = newNickname;
+          message = message;
+          nickname = finalNickname;
           gameProfile = gameProfile;
         })
       };
@@ -4352,6 +5235,179 @@ public shared func revokeApiKeyBySession(
       };
     };
   };
+
+
+  // Submit a score to ONE targeted (category) board. Mirrors submitScore's
+  // front-half but writes a single board and does NOT touch the player's
+  // aggregate gameProfile / dailyStats / all-time cache.
+  public shared(msg) func submitScoreToBoard(
+    userIdType : Text,
+    userId : Text,
+    gameId : Text,
+    scoreboardId : Text,
+    scoreNat : Nat,
+    streakNat : Nat,
+    nickname : ?Text,
+    playSessionToken : ?Text
+  ) : async Result.Result<Text, Text> {
+
+    totalSubmissions += 1;
+    let t = now();
+    let currentDate = getDateString(t);
+    if (currentDate != lastResetDate) {
+      submissionsToday := 0;
+      lastResetDate := currentDate;
+    };
+    submissionsToday += 1;
+
+    switch (validateCaller(msg, userIdType, userId)) {
+      case (#err(e)) { return #err(e) };
+      case (#ok(_)) {};
+    };
+
+    let identifier : UserIdentifier = switch (userIdType) {
+      case ("email") {
+        switch (validateSessionInternal(userId)) {
+          case (#err(e)) { return #err(e) };
+          case (#ok(session)) { #email(session.email) };
+        };
+      };
+      case ("session") {
+        switch (validateSessionInternal(userId)) {
+          case (#err(e)) { return #err(e) };
+          case (#ok(session)) { #email(session.email) };
+        };
+      };
+      case ("principal") { #principal(msg.caller) };
+      case ("external") { #email("ext:" # userId) };
+      case (_) { return #err("Invalid user type") };
+    };
+
+    let score = Nat64.fromNat(scoreNat);
+    let streak = Nat64.fromNat(streakNat);
+
+    let game = switch (games.get(gameId)) {
+      case null { return #err("Game not found. Please register the game first.") };
+      case (?g) {
+        if (not g.isActive) { return #err("Game is not active") };
+        g
+      };
+    };
+
+    switch (validateAccessMode(game, userIdType)) {
+      case (#err(e)) { return #err(e) };
+      case (#ok(_)) {};
+    };
+
+    // Target board must exist, belong to this game, be active, and be targeted.
+    let sbKey = makeScoreboardKey(gameId, scoreboardId);
+    let config = switch (scoreboardConfigs.get(sbKey)) {
+      case null { return #err("Scoreboard '" # scoreboardId # "' not found for this game.") };
+      case (?c) {
+        if (c.gameId != gameId) { return #err("Scoreboard does not belong to this game.") };
+        if (not c.isActive) { return #err("Scoreboard is not active.") };
+        if (c.targeted != ?true) {
+          return #err("'" # scoreboardId # "' is a fan-out board - submit without a scoreboardId so it gets the normal fan-out.");
+        };
+        c
+      };
+    };
+
+    switch (validateScore(score, gameId)) {
+      case (#err(e)) { logSuspicion(userId # "/" # userIdType, gameId, "Invalid score: " # e); return #err(e) };
+      case (#ok()) {};
+    };
+    switch (validateStreak(streak, gameId)) {
+      case (#err(e)) { logSuspicion(userId # "/" # userIdType, gameId, "Invalid streak: " # e); return #err(e) };
+      case (#ok()) {};
+    };
+
+    var user = getUserByIdentifier(identifier);
+    if (Option.isNull(user) and userIdType == "external") {
+      userIdCounter += 1;
+      let playerNickname = switch (nickname) {
+        case (?n) {
+          if (Text.size(n) >= 2 and Text.size(n) <= 20 and not isNicknameTaken(n, null)) { n }
+          else { "Player_" # Nat.toText(userIdCounter) }
+        };
+        case null { "Player_" # Nat.toText(userIdCounter) };
+      };
+      let newUser : UserProfile = {
+        identifier = identifier;
+        nickname = playerNickname;
+        authType = #external;
+        gameProfiles = [];
+        created = t;
+        last_updated = t;
+      };
+      usersByEmail.put("ext:" # userId, newUser);
+      user := ?newUser;
+    };
+
+    switch (user) {
+      case null { #err("User not found. Please login first.") };
+      case (?u) {
+        let effectiveNick = switch (nickname) {
+          case (?n) {
+            if (n != u.nickname and Text.size(n) >= 2 and Text.size(n) <= 20 and not isNicknameTaken(n, ?u.identifier)) {
+              putUserByIdentifier({
+                identifier = u.identifier;
+                nickname = n;
+                authType = u.authType;
+                gameProfiles = u.gameProfiles;
+                created = u.created;
+                last_updated = t;
+              });
+              n
+            } else { u.nickname }
+          };
+          case null { u.nickname };
+        };
+
+        // Per-(user, game, board) throttle so chained board submits don't trip the gate.
+        let submitKey = makeSubmitKey(u.identifier, gameId) # ":" # scoreboardId;
+        switch (lastSubmitTime.get(submitKey)) {
+          case (?prev) {
+            if (t - prev < 2_000_000_000) { return #err("Please wait 2 seconds between submissions.") };
+          };
+          case null {};
+        };
+        lastSubmitTime.put(submitKey, t);
+
+        let timeRules = getTimeValidationRules(gameId);
+        if (timeRules.enabled) {
+          switch (playSessionToken) {
+            case null {
+              return #err("This game requires starting a session before submitting. Call startGameSession first.");
+            };
+            case (?token) {
+              let validation = validatePlaySession(token, u.identifier, gameId, score);
+              if (not validation.isValid) {
+                switch (validation.reason) {
+                  case (?reason) { logSuspicion(identifierToText(u.identifier), gameId, "Time validation failed: " # reason); return #err(reason) };
+                  case null { return #err("Play session validation failed.") };
+                };
+              };
+              consumePlaySession(token);
+            };
+          };
+        };
+
+        // Write to JUST this board. No aggregate gameProfile / all-time mutation.
+        writeEntryToBoard(sbKey, config, u.identifier, effectiveNick, score, streak, u.authType, t);
+
+        trackEventInternal(u.identifier, gameId, "board_score", [
+          ("scoreboardId", scoreboardId),
+          ("score", Nat64.toText(score)),
+          ("streak", Nat64.toText(streak)),
+          ("auth_type", authTypeToText(u.authType))
+        ]);
+
+        #ok("✅ Submitted to " # scoreboardId # " - Score: " # Nat64.toText(score) # ", Streak: " # Nat64.toText(streak))
+      };
+    };
+  };
+
 
 
   // ════════════════════════════════════════════════════════════════════════════
@@ -4959,7 +6015,7 @@ public shared func revokeApiKeyBySession(
 
 
   // Helper: Reset a scoreboard
-  private func resetScoreboard(key : Text, config : ScoreboardConfig) : () {
+  private func archiveAndClearScoreboard(key : Text, config : ScoreboardConfig) : () {
 
     archiveScoreboard(key, config);
     
@@ -4974,6 +6030,8 @@ public shared func revokeApiKeyBySession(
       created = config.created;
       lastReset = now();
       isActive = config.isActive;
+      targeted = config.targeted;
+      resetIntervalNanos = config.resetIntervalNanos;
     };
     scoreboardConfigs.put(key, newConfig);
     scoreboardEntries.put(key, Buffer.Buffer<ScoreEntry>(100));
@@ -4992,7 +6050,9 @@ public shared func revokeApiKeyBySession(
     description : Text,
     periodText : Text,
     sortByText : Text,
-    maxEntries : ?Nat
+    maxEntries : ?Nat,
+    targeted : Bool,
+    intervalDays : ?Nat
   ) : async Result.Result<Text, Text> {
     
     switch (getOwnerFromSession(sessionId)) {
@@ -5040,6 +6100,10 @@ public shared func revokeApiKeyBySession(
         };
 
         let currentTime = now();
+        let resetIntervalNanos : ?Nat64 = switch (intervalDays) {
+          case (?d) { if (d == 0) null else ?(Nat64.fromNat(d) * Scoreboards.DAY_IN_NANOS) };
+          case null { null };
+        };
         
         let config : ScoreboardConfig = {
           scoreboardId = scoreboardId;
@@ -5052,6 +6116,8 @@ public shared func revokeApiKeyBySession(
           created = currentTime;
           lastReset = currentTime;
           isActive = true;
+          targeted = ?targeted;
+          resetIntervalNanos = resetIntervalNanos;
         };
 
         scoreboardConfigs.put(key, config);
@@ -5082,6 +6148,8 @@ public shared func revokeApiKeyBySession(
     lastReset : Nat64;
     entryCount : Nat;
     isActive : Bool;
+    targeted : ?Bool;
+    resetIntervalDays : ?Nat;
   }] {
     let results = Buffer.Buffer<{
       scoreboardId : Text;
@@ -5093,6 +6161,8 @@ public shared func revokeApiKeyBySession(
       lastReset : Nat64;
       entryCount : Nat;
       isActive : Bool;
+      targeted : ?Bool;
+      resetIntervalDays : ?Nat;
     }>(10);
 
     for ((key, config) in scoreboardConfigs.entries()) {
@@ -5112,6 +6182,8 @@ public shared func revokeApiKeyBySession(
           lastReset = config.lastReset;
           entryCount = entryCount;
           isActive = config.isActive;
+          targeted = config.targeted;
+          resetIntervalDays = switch (config.resetIntervalNanos) { case (?n) { ?Nat64.toNat(n / Scoreboards.DAY_IN_NANOS) }; case null { null } };
         });
       };
     };
@@ -5170,6 +6242,26 @@ public shared func revokeApiKeyBySession(
             };
           };
           case null {};
+        };
+        let isExpired = switch (config.period) {
+          case (#allTime) { false };
+          case (#custom) { false };
+          case (#daily) { Scoreboards.shouldResetDaily(config.lastReset, now()) };
+          case (#weekly) { Scoreboards.shouldResetWeekly(config.lastReset, now()) };
+          case (#monthly) { Scoreboards.shouldResetMonthly(config.lastReset, now()) };
+        };
+
+        if (isExpired) {
+          return #ok({
+            config = {
+              name = config.name;
+              description = config.description;
+              period = periodToText(config.period);
+              sortBy = switch (config.sortBy) { case (#score) "score"; case (#streak) "streak" };
+              lastReset = config.lastReset;
+            };
+            entries = [];
+          });
         };
 
         // Build fresh leaderboard
@@ -5284,7 +6376,7 @@ public shared func revokeApiKeyBySession(
 
         // Check if scoreboard needs reset
         if (scoreboardNeedsReset(config)) {
-          resetScoreboard(key, config);
+          archiveAndClearScoreboard(key, config);
         };
 
         // Validate game exists
@@ -5518,7 +6610,7 @@ public shared func revokeApiKeyBySession(
         switch (scoreboardConfigs.get(key)) {
           case null { return #err("Scoreboard not found") };
           case (?config) {
-            resetScoreboard(key, config);
+            archiveAndClearScoreboard(key, config);
             
             trackEventInternal(#principal(owner), gameId, "scoreboard_reset", [
               ("scoreboardId", scoreboardId)
@@ -5571,6 +6663,8 @@ public shared func revokeApiKeyBySession(
               created = config.created;
               lastReset = config.lastReset;
               isActive = false;
+              targeted = config.targeted;
+              resetIntervalNanos = config.resetIntervalNanos;
             };
             scoreboardConfigs.put(key, updated);
             
@@ -5638,12 +6732,247 @@ public shared func revokeApiKeyBySession(
               created = config.created;
               lastReset = config.lastReset;
               isActive = config.isActive;
+              targeted = config.targeted;
+              resetIntervalNanos = config.resetIntervalNanos;
             };
             scoreboardConfigs.put(key, updated);
             
             #ok("Scoreboard updated successfully")
           };
         };
+      };
+    };
+  };
+
+  // ═══════════════════════════════════════════════════════════════════════════════
+  // SCOREBOARD MANAGEMENT — Internet Identity (principal) variants
+  // ═══════════════════════════════════════════════════════════════════════════════
+
+  public shared(msg) func createScoreboard(
+    gameId : Text,
+    scoreboardId : Text,
+    name : Text,
+    description : Text,
+    periodText : Text,
+    sortByText : Text,
+    maxEntries : ?Nat,
+    targeted : Bool,
+    intervalDays : ?Nat
+  ) : async Result.Result<Text, Text> {
+
+    if (Principal.isAnonymous(msg.caller)) {
+      return #err("❌ Must authenticate with chedda");
+    };
+    let owner = msg.caller;
+
+    // Verify game ownership
+    switch (games.get(gameId)) {
+      case null { return #err("Game not found") };
+      case (?game) {
+        if (not Principal.equal(game.owner, owner)) {
+          return #err("You don't own this game");
+        };
+      };
+    };
+
+    // Validate scoreboard ID
+    if (Text.size(scoreboardId) < 2 or Text.size(scoreboardId) > 30) {
+      return #err("Scoreboard ID must be 2-30 characters");
+    };
+
+    let key = makeScoreboardKey(gameId, scoreboardId);
+
+    // Already exists?
+    switch (scoreboardConfigs.get(key)) {
+      case (?_) { return #err("Scoreboard ID already exists for this game") };
+      case null {};
+    };
+
+    let period = switch (textToPeriod(periodText)) {
+      case null { return #err("Invalid period. Use: allTime, daily, weekly, monthly, custom") };
+      case (?p) { p };
+    };
+
+    let sortBy : SortBy = switch (sortByText) {
+      case ("score") { #score };
+      case ("streak") { #streak };
+      case (_) { return #err("Invalid sortBy. Use: score or streak") };
+    };
+
+    let maxEntriesVal = switch (maxEntries) {
+      case (?n) { if (n > 1000) 1000 else if (n < 10) 10 else n };
+      case null { 100 };
+    };
+
+    let currentTime = now();
+    let resetIntervalNanos : ?Nat64 = switch (intervalDays) {
+      case (?d) { if (d == 0) null else ?(Nat64.fromNat(d) * Scoreboards.DAY_IN_NANOS) };
+      case null { null };
+    };
+
+    let config : ScoreboardConfig = {
+      scoreboardId = scoreboardId;
+      gameId = gameId;
+      name = name;
+      description = description;
+      period = period;
+      sortBy = sortBy;
+      maxEntries = maxEntriesVal;
+      created = currentTime;
+      lastReset = currentTime;
+      isActive = true;
+      targeted = ?targeted;
+      resetIntervalNanos = resetIntervalNanos;
+    };
+
+    scoreboardConfigs.put(key, config);
+    scoreboardEntries.put(key, Buffer.Buffer<ScoreEntry>(100));
+
+    trackEventInternal(#principal(owner), gameId, "scoreboard_created", [
+      ("scoreboardId", scoreboardId),
+      ("period", periodText),
+      ("sortBy", sortByText)
+    ]);
+
+    #ok("Scoreboard '" # name # "' created successfully!")
+  };
+
+  public shared(msg) func resetScoreboard(
+    gameId : Text,
+    scoreboardId : Text
+  ) : async Result.Result<Text, Text> {
+
+    if (Principal.isAnonymous(msg.caller)) {
+      return #err("❌ Must authenticate with chedda");
+    };
+    let owner = msg.caller;
+
+    switch (games.get(gameId)) {
+      case null { return #err("Game not found") };
+      case (?game) {
+        if (not Principal.equal(game.owner, owner)) {
+          return #err("You don't own this game");
+        };
+      };
+    };
+
+    let key = makeScoreboardKey(gameId, scoreboardId);
+
+    switch (scoreboardConfigs.get(key)) {
+      case null { return #err("Scoreboard not found") };
+      case (?config) {
+        archiveAndClearScoreboard(key, config);
+        trackEventInternal(#principal(owner), gameId, "scoreboard_reset", [
+          ("scoreboardId", scoreboardId)
+        ]);
+        #ok("Scoreboard '" # config.name # "' has been reset")
+      };
+    };
+  };
+
+  public shared(msg) func deleteScoreboard(
+    gameId : Text,
+    scoreboardId : Text
+  ) : async Result.Result<Text, Text> {
+
+    if (Principal.isAnonymous(msg.caller)) {
+      return #err("❌ Must authenticate with chedda");
+    };
+    let owner = msg.caller;
+
+    switch (games.get(gameId)) {
+      case null { return #err("Game not found") };
+      case (?game) {
+        if (not Principal.equal(game.owner, owner)) {
+          return #err("You don't own this game");
+        };
+      };
+    };
+
+    let key = makeScoreboardKey(gameId, scoreboardId);
+
+    switch (scoreboardConfigs.get(key)) {
+      case null { return #err("Scoreboard not found") };
+      case (?config) {
+        // Soft delete — mark inactive
+        let updated : ScoreboardConfig = {
+          scoreboardId = config.scoreboardId;
+          gameId = config.gameId;
+          name = config.name;
+          description = config.description;
+          period = config.period;
+          sortBy = config.sortBy;
+          maxEntries = config.maxEntries;
+          created = config.created;
+          lastReset = config.lastReset;
+          isActive = false;
+          targeted = config.targeted;
+          resetIntervalNanos = config.resetIntervalNanos;
+        };
+        scoreboardConfigs.put(key, updated);
+        scoreboardEntries.delete(key);
+        cachedScoreboards.delete(key);
+
+        trackEventInternal(#principal(owner), gameId, "scoreboard_deleted", [
+          ("scoreboardId", scoreboardId)
+        ]);
+
+        #ok("Scoreboard '" # config.name # "' has been deleted")
+      };
+    };
+  };
+
+  public shared(msg) func updateScoreboard(
+    gameId : Text,
+    scoreboardId : Text,
+    name : ?Text,
+    description : ?Text,
+    maxEntries : ?Nat
+  ) : async Result.Result<Text, Text> {
+
+    if (Principal.isAnonymous(msg.caller)) {
+      return #err("❌ Must authenticate with chedda");
+    };
+    let owner = msg.caller;
+
+    switch (games.get(gameId)) {
+      case null { return #err("Game not found") };
+      case (?game) {
+        if (not Principal.equal(game.owner, owner)) {
+          return #err("You don't own this game");
+        };
+      };
+    };
+
+    let key = makeScoreboardKey(gameId, scoreboardId);
+
+    switch (scoreboardConfigs.get(key)) {
+      case null { return #err("Scoreboard not found") };
+      case (?config) {
+        let newName = switch (name) { case (?n) n; case null config.name };
+        let newDesc = switch (description) { case (?d) d; case null config.description };
+        let newMax = switch (maxEntries) {
+          case (?n) { if (n > 1000) 1000 else if (n < 10) 10 else n };
+          case null config.maxEntries
+        };
+
+        let updated : ScoreboardConfig = {
+          scoreboardId = config.scoreboardId;
+          gameId = config.gameId;
+          name = newName;
+          description = newDesc;
+          period = config.period;
+          sortBy = config.sortBy;
+          maxEntries = newMax;
+          created = config.created;
+          lastReset = config.lastReset;
+          isActive = config.isActive;
+          targeted = config.targeted;
+          resetIntervalNanos = config.resetIntervalNanos;
+        };
+        scoreboardConfigs.put(key, updated);
+
+        #ok("Scoreboard updated successfully")
       };
     };
   };
@@ -7954,6 +9283,18 @@ case ("downgradeDeveloper") {
         }
       };
       
+      case ("repairMigratedStreaks") {
+        if (not hasPermission(msg.caller, #SuperAdmin)) {
+          #err("🔒 Permission denied: SuperAdmin role required")
+        } else {
+          // args[0] selects dry-run vs apply. Default to dry-run when absent
+          // so a bare call can't accidentally write.
+          let dryRun = if (args.size() < 1) { true }
+                       else { args[0] != "false" };
+          #ok(repairMigratedStreaksInternal(dryRun))
+        }
+      };
+      
       case ("help") {
         #ok("📚 ADMIN COMMANDS\n" #
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" #
@@ -7984,6 +9325,7 @@ case ("downgradeDeveloper") {
             "  • auditLog [limit]\n" #
             "\n⚠️ Dangerous (SuperAdmin)\n" #
             "  • permanentDelete <userId>\n" #
+            "  • repairMigratedStreaks [true|false]  (true=dry-run, default true)\n" #
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" #
             "Roles: SuperAdmin > Moderator > Support > ReadOnly")
       };
