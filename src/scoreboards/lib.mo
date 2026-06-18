@@ -140,7 +140,13 @@ module {
   public func needsReset(config : ScoreboardConfig, currentTime : Nat64) : Bool {
     switch (config.period) {
       case (#allTime) { false };
-      case (#custom) { false };
+      case (#custom) {
+        // Configurable: never, unless a reset interval is set — then every N nanos.
+        switch (config.resetIntervalNanos) {
+          case (?n) { n > 0 and currentTime - config.lastReset >= n };
+          case null { false };
+        }
+      };
       case (#daily) { shouldResetDaily(config.lastReset, currentTime) };
       case (#weekly) { shouldResetWeekly(config.lastReset, currentTime) };
       case (#monthly) { shouldResetMonthly(config.lastReset, currentTime) };
@@ -310,6 +316,8 @@ module {
     period : ScoreboardPeriod,
     sortBy : SortBy,
     maxEntries : Nat,
+    targeted : Bool,
+    resetIntervalNanos : ?Nat64,
     timestamp : Nat64
   ) : ScoreboardConfig {
     {
@@ -323,6 +331,8 @@ module {
       created = timestamp;
       lastReset = timestamp;
       isActive = true;
+      targeted = ?targeted;
+      resetIntervalNanos = resetIntervalNanos;
     }
   };
 
@@ -339,6 +349,8 @@ module {
       created = config.created;
       lastReset = newTimestamp;
       isActive = config.isActive;
+      targeted = config.targeted;
+      resetIntervalNanos = config.resetIntervalNanos;
     }
   };
 
@@ -352,6 +364,8 @@ module {
       #allTime,
       #score,
       DEFAULT_MAX_ENTRIES,
+      false,   // targeted: fan-out board
+      null,    // resetIntervalNanos: n/a for #allTime
       timestamp
     )
   };
@@ -366,6 +380,8 @@ module {
       #weekly,
       #score,
       DEFAULT_MAX_ENTRIES,
+      false,   // targeted: fan-out board
+      null,    // resetIntervalNanos: n/a for #weekly
       timestamp
     )
   };
