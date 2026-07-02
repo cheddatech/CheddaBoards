@@ -121,19 +121,73 @@ module {
   // TIME / PERIOD HELPERS
   // ════════════════════════════════════════════════════════════════════════════
 
-  /// Check if daily scoreboard should reset
+  // ── Calendar boundary helpers (all UTC) ──────────────────────────────────
+  // ICP time is nanoseconds since the Unix epoch, so day boundaries fall out
+  // of integer division. Week/month need a little more work.
+
+  /// Start of the current UTC day (00:00)
+  public func dayStart(currentTime : Nat64) : Nat64 {
+    (currentTime / DAY_IN_NANOS) * DAY_IN_NANOS
+  };
+
+  /// Start of the current ISO week (Monday 00:00 UTC)
+  public func weekStart(currentTime : Nat64) : Nat64 {
+    let d = currentTime / DAY_IN_NANOS;
+    // 1 Jan 1970 was a Thursday, so days since the most recent Monday = (d + 3) % 7
+    let daysSinceMonday = (d + 3) % 7;
+    (d - daysSinceMonday) * DAY_IN_NANOS
+  };
+
+  /// Start of the current calendar month (1st, 00:00 UTC).
+  /// Uses the civil-from-days algorithm (handles month lengths + leap years).
+  public func monthStart(currentTime : Nat64) : Nat64 {
+    let d = currentTime / DAY_IN_NANOS;
+    let z = d + 719_468;
+    let doe = z % 146_097;                                              // day of era [0, 146096]
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365; // year of era [0, 399]
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);                  // day of (Mar-based) year
+    let mp = (5 * doy + 2) / 153;                                       // month index [0, 11]
+    let dayOfMonth0 = doy - (153 * mp + 2) / 5;                         // day of month, 0-based
+    (d - dayOfMonth0) * DAY_IN_NANOS
+  };
+
+  /// Check if daily scoreboard should reset (midnight UTC boundary)
   public func shouldResetDaily(lastReset : Nat64, currentTime : Nat64) : Bool {
-    currentTime - lastReset >= DAY_IN_NANOS
+    lastReset < dayStart(currentTime)
   };
 
-  /// Check if weekly scoreboard should reset
+  /// Check if weekly scoreboard should reset (Monday 00:00 UTC boundary)
   public func shouldResetWeekly(lastReset : Nat64, currentTime : Nat64) : Bool {
-    currentTime - lastReset >= WEEK_IN_NANOS
+    lastReset < weekStart(currentTime)
   };
 
-  /// Check if monthly scoreboard should reset
+  /// Check if monthly scoreboard should reset (1st of month 00:00 UTC boundary)
   public func shouldResetMonthly(lastReset : Nat64, currentTime : Nat64) : Bool {
-    currentTime - lastReset >= MONTH_IN_NANOS
+    lastReset < monthStart(currentTime)
+  };
+
+  /// Where the CURRENT period began. Use this as the new lastReset when a
+  /// board resets (sweep or lazy write-side reset) so periods stay anchored
+  /// to calendar boundaries — and so archive periodStart values are exact.
+  public func currentPeriodStart(config : ScoreboardConfig, currentTime : Nat64) : Nat64 {
+    switch (config.period) {
+      case (#daily) { dayStart(currentTime) };
+      case (#weekly) { weekStart(currentTime) };
+      case (#monthly) { monthStart(currentTime) };
+      case (#custom) {
+        switch (config.resetIntervalNanos) {
+          case (?n) {
+            if (n == 0) { currentTime } else {
+              // Snap forward from lastReset by whole intervals (no drift)
+              let elapsed = currentTime - config.lastReset;
+              config.lastReset + (elapsed / n) * n
+            }
+          };
+          case null { currentTime };
+        }
+      };
+      case (#allTime) { currentTime };
+    }
   };
 
   /// Check if a scoreboard needs reset based on its period and current time
