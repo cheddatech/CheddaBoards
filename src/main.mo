@@ -1,18 +1,11 @@
 // main.mo - CheddaBoards Backend
+
+//     SETUP REQUIRED: Search for "REPLACE WITH YOUR" and set:
+//     - VERIFIER: Your OAuth token verifier canister principal
+//     - CONTROLLER: Your super admin principal (usually your dfx identity)
+//     - firstAdmin: Initial admin principal (can be same as CONTROLLER)
 //
-// SETUP REQUIRED before deploying:
-//   Search this file for "REPLACE WITH YOUR" and set each one. Until you do,
-//   they default to the management-canister principal ("aaaaa-aa") - a valid,
-//   non-functional placeholder that no user controls, so nobody has admin and
-//   OAuth verification stays inert. Safe to compile and deploy, but configure
-//   these before relying on it.
-//
-//     - VERIFIER   : your OAuth token-verifier canister principal
-//     - CONTROLLER : your super-admin principal
-//                    (usually your dfx identity: `dfx identity get-principal`)
-//     - firstAdmin : your initial admin principal (can equal CONTROLLER)
-//
-// See README for full deployment instructions.
+// See README for deployment instructions.
 
 import HashMap "mo:base/HashMap";
 import Principal "mo:base/Principal";
@@ -112,7 +105,8 @@ persistent actor CheddaBoards {
   // CONSTANTS
   // ════════════════════════════════════════════════════════════════════════════
 
-  // REPLACE WITH YOUR OAuth verifier canister principal (placeholder = management canister, non-functional)
+  // REPLACE WITH YOUR OAuth token verifier canister principal.
+  // "aaaaa-aa" is a safe placeholder (compiles, but OAuth login will fail until set).
   let VERIFIER : Principal = Principal.fromText("aaaaa-aa");
   
   // ════════════════════════════════════════════════════════════════════════════
@@ -203,8 +197,9 @@ persistent actor CheddaBoards {
   // CONSTANTS
   // ════════════════════════════════════════════════════════════════════════════
 
-  // REPLACE WITH YOUR super-admin principal - usually your dfx identity (`dfx identity get-principal`).
-  // Placeholder is the management canister, which no user controls, so no one has admin until you set this.
+  // REPLACE WITH YOUR super admin principal (usually your dfx identity:
+  // `dfx identity get-principal`). "aaaaa-aa" is a safe placeholder — it can
+  // never be msg.caller, so no one has admin until you set this.
   private var CONTROLLER : Principal = Principal.fromText("aaaaa-aa");
   private transient let SESSION_DURATION_NS : Nat64 = 24 * 60 * 60 * 1_000_000_000;
   private transient var lastCleanup : Nat64 = 0;
@@ -435,28 +430,12 @@ private func getDeveloperTierText(owner: Principal) : Text {
     }
   };
 
-    private func getPeriodDuration(config : ScoreboardConfig) : ?Nat64 {
-      switch (config.period) {
-        case (#daily)   { ?Scoreboards.DAY_IN_NANOS };
-        case (#weekly)  { ?Scoreboards.WEEK_IN_NANOS };
-        case (#monthly) { ?Scoreboards.MONTH_IN_NANOS };
-        case (#allTime) { null };
-        case (#custom)  { config.resetIntervalNanos };  // every-N, or null = never
-      }
-    };
-
     private func calculateCurrentPeriodStart(config : ScoreboardConfig, currentTime : Nat64) : Nat64 {
-      switch (getPeriodDuration(config)) {
-        case null { config.lastReset }; // allTime, or custom with no interval - no-op
-        case (?duration) {
-          if (duration == 0) { return config.lastReset };
-          var boundary = config.lastReset;
-          while (boundary + duration <= currentTime) {
-            boundary += duration;
-          };
-          boundary
-        };
-      }
+      // Delegated: daily/weekly/monthly snap to calendar boundaries
+      // (midnight / Monday / 1st of month, all UTC); #custom snaps forward
+      // from lastReset by whole intervals; #allTime & interval-less custom
+      // return currentTime (callers only reach this when a reset is due).
+      Scoreboards.currentPeriodStart(config, currentTime)
     };
 
   // ════════════════════════════════════════════════════════════════════════════
@@ -972,7 +951,10 @@ private func createDefaultScoreboards(gameId : Text, owner : Principal) : () {
         sortBy = config.sortBy;
         maxEntries = config.maxEntries;
         created = config.created;
-        lastReset = t;
+        // Anchor to the period boundary (midnight/Monday/1st UTC, or the
+        // custom-interval step), not the submission time — keeps periods
+        // aligned and archive periodStart values exact.
+        lastReset = Scoreboards.currentPeriodStart(config, t);
         isActive = config.isActive;
         targeted = config.targeted;
         resetIntervalNanos = config.resetIntervalNanos;
@@ -2696,7 +2678,7 @@ system func postupgrade() {
     );
     playSessionsStable := [];
 
-    // REPLACE WITH YOUR initial admin principal (can be the same as CONTROLLER).
+    // REPLACE WITH YOUR initial admin principal (can be same as CONTROLLER).
     let firstAdmin = Principal.fromText("aaaaa-aa");
     adminRoles.put(firstAdmin, #SuperAdmin);
 
