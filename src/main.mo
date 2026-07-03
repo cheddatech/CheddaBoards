@@ -804,7 +804,10 @@ private func getDeveloperTierText(owner: Principal) : Text {
       sortBy = config.sortBy;
       periodStart = config.lastReset;
       periodEnd = t;
-      entries = Buffer.toArray(entriesBuffer);
+      // Sort into final leaderboard order at archive time — the live buffer
+      // is insertion-ordered and only sorted at read time, but archives are
+      // read raw by the dashboard/API, so store them canonically sorted.
+      entries = Scoreboards.sortEntries(Buffer.toArray(entriesBuffer), config.sortBy);
       totalEntries = entriesBuffer.size();
     };
     
@@ -3908,14 +3911,18 @@ public query func getScoreboardArchives(
     switch (scoreboardArchives.get(archiveId)) {
       case null { #err("Archive not found") };
       case (?archive) {
-        let cap = if (limit == 0 or limit > archive.entries.size()) { 
-          archive.entries.size() 
+        // Sort before ranking/truncation — covers archives stored before
+        // sorting-at-archive-time was added (they're in insertion order).
+        let sortedEntries = Scoreboards.sortEntries(archive.entries, archive.sortBy);
+
+        let cap = if (limit == 0 or limit > sortedEntries.size()) { 
+          sortedEntries.size() 
         } else { limit };
         
         let publicEntries = Buffer.Buffer<PublicScoreEntry>(cap);
         var rank : Nat = 1;
         
-        for (entry in archive.entries.vals()) {
+        for (entry in sortedEntries.vals()) {
           if (rank <= cap) {
             publicEntries.add({
               nickname = entry.nickname;
@@ -4028,16 +4035,18 @@ public query func getScoreboardArchives(
       if (Text.startsWith(key, #text prefix)) {
         // Check if archive falls within range
         if (archive.periodEnd >= afterTimestamp and archive.periodEnd <= beforeTimestamp) {
-          let topPlayer : ?Text = if (archive.entries.size() > 0) {
-            ?archive.entries[0].nickname
-          } else { null };
-          
-          let topScore : Nat64 = if (archive.entries.size() > 0) {
-            switch (archive.sortBy) {
-              case (#score) { archive.entries[0].score };
-              case (#streak) { archive.entries[0].streak };
-            }
-          } else { 0 };
+          // Find the actual best entry — archives stored before
+          // sorting-at-archive-time have entries in insertion order,
+          // so entries[0] is the first submitter, not the winner.
+          var topPlayer : ?Text = null;
+          var topScore : Nat64 = 0;
+          for (entry in archive.entries.vals()) {
+            let v = Scoreboards.getEntryValue(entry, archive.sortBy);
+            if (topPlayer == null or v > topScore) {
+              topPlayer := ?entry.nickname;
+              topScore := v;
+            };
+          };
           
           results.add({
             archiveId = key;
