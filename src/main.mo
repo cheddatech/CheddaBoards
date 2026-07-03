@@ -3859,16 +3859,18 @@ public query func getScoreboardArchives(
     
     for ((key, archive) in scoreboardArchives.entries()) {
       if (Text.startsWith(key, #text prefix)) {
-        let topPlayer : ?Text = if (archive.entries.size() > 0) {
-          ?archive.entries[0].nickname
-        } else { null };
-        
-        let topScore : Nat64 = if (archive.entries.size() > 0) {
-          switch (archive.sortBy) {
-            case (#score) { archive.entries[0].score };
-            case (#streak) { archive.entries[0].streak };
-          }
-        } else { 0 };
+        // Find the actual best entry — archives stored before
+        // sorting-at-archive-time have entries in insertion order,
+        // so entries[0] is the first submitter, not the winner.
+        var topPlayer : ?Text = null;
+        var topScore : Nat64 = 0;
+        for (entry in archive.entries.vals()) {
+          let v = Scoreboards.getEntryValue(entry, archive.sortBy);
+          if (topPlayer == null or v > topScore) {
+            topPlayer := ?entry.nickname;
+            topScore := v;
+          };
+        };
         
         results.add({
           archiveId = key;
