@@ -115,6 +115,13 @@ dfx generate cheddaboards
 
 You'll need to build your own API layer to translate REST/HTTP requests into canister calls. It must verify OAuth tokens itself (e.g. via JWKS) and call the canister with the signing identity you set as `VERIFIER_PRINCIPAL` — the canister rejects privileged auth calls from anyone else. The Candid interface defines all available methods and their signatures.
 
+Your proxy will typically need, however you choose to configure it:
+
+- **Canister ID** of your deployed instance, and an IC host (`https://icp-api.io`, or `http://127.0.0.1:4943` for local dfx)
+- **A signing identity** (e.g. Ed25519 keypair) whose principal you set as `VERIFIER_PRINCIPAL` in `main.mo` — keep the private key secret; it can mint sessions for any user
+- **OAuth client IDs** for whichever providers you support (Google client ID, Apple Service ID / Bundle ID)
+- **Allowed CORS origins** for the domains your games are served from — avoid wildcards in production
+
 ---
 
 ## Using the Hosted Version
