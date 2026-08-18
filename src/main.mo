@@ -105,9 +105,17 @@ persistent actor CheddaBoards {
   // CONSTANTS
   // ════════════════════════════════════════════════════════════════════════════
 
-  // REPLACE WITH YOUR OAuth token verifier canister principal.
-  // "aaaaa-aa" is a safe placeholder (compiles, but OAuth login will fail until set).
-  let VERIFIER : Principal = Principal.fromText("aaaaa-aa");
+  // VERIFIER: principal of your proxy's signing identity.
+  // Only this principal may call the privileged auth methods (e.g.
+  // socialLoginAndGetProfile) that mint sessions from verified OAuth emails.
+  // >>> REPLACE the placeholder below with your proxy's signing principal,
+  // >>> deploy the proxy (with its matching signing identity) FIRST, and this
+  // >>> canister SECOND. Leaving the placeholder disables OAuth login entirely.
+  // NOTE: this actor is `persistent`, so this var is stable and survives
+  // upgrades — the value is single-sourced via VERIFIER_PRINCIPAL and
+  // force-reassigned in postupgrade(); edit VERIFIER_PRINCIPAL only.
+  private transient let VERIFIER_PRINCIPAL : Text = "aaaaa-aa";
+  var VERIFIER : Principal = Principal.fromText(VERIFIER_PRINCIPAL);
   
   // ════════════════════════════════════════════════════════════════════════════
   // STABLE STORAGE
@@ -131,6 +139,19 @@ persistent actor CheddaBoards {
   
   private var stableSessions : [(Text, Session)] = [];
   private var stableSuspicionLog : [{ player_id : Text; gameId : Text; reason : Text; timestamp : Nat64 }] = [];
+  // Audit trail for dev-initiated board entry deletions
+  type EntryDeletionRecord = {
+    caller : Principal;
+    gameId : Text;
+    scope : Text;        // scoreboardId, or "ALL" for a player wipe
+    playerKey : Text;    // opaque hash of the player identifier
+    nickname : Text;
+    liveRemoved : Nat;
+    archiveRemoved : Nat;
+    profileReset : Bool;
+    timestamp : Nat64;
+  };
+  private var stableEntryDeletionLog : [EntryDeletionRecord] = [];
   private var stableFiles : [(Text, Blob)] = [];
   private var stableAnalyticsEvents : [AnalyticsEvent] = [];
   private var stableDailyStats : [(Text, DailyStats)] = [];
@@ -175,6 +196,7 @@ persistent actor CheddaBoards {
   private transient var playerStats = HashMap.HashMap<Text, PlayerStats>(10, Text.equal, Text.hash);
   private transient var apiKeys = HashMap.HashMap<Text, ApiKey>(50, Text.equal, Text.hash);
   private transient var suspicionLog : List.List<{ player_id : Text; gameId : Text; reason : Text; timestamp : Nat64 }> = List.nil();
+  private transient var entryDeletionLog : List.List<EntryDeletionRecord> = List.nil();
   private transient var files : List.List<(Text, Blob)> = List.nil();
   private transient var sessionsEntries : [(Text, Session)] = [];
   private transient var principalToSessionEntries : [(Text, Text)] = [];
@@ -197,9 +219,10 @@ persistent actor CheddaBoards {
   // CONSTANTS
   // ════════════════════════════════════════════════════════════════════════════
 
-  // REPLACE WITH YOUR super admin principal (usually your dfx identity:
-  // `dfx identity get-principal`). "aaaaa-aa" is a safe placeholder — it can
-  // never be msg.caller, so no one has admin until you set this.
+  // CONTROLLER: your dfx identity's principal (`dfx identity get-principal`).
+  // Grants SuperAdmin access to adminGate commands. REPLACE before deploying.
+  // NOTE: implicitly stable (persistent actor) — changing this literal after
+  // the first deploy has no effect on an upgraded canister; see VERIFIER above.
   private var CONTROLLER : Principal = Principal.fromText("aaaaa-aa");
   private transient let SESSION_DURATION_NS : Nat64 = 24 * 60 * 60 * 1_000_000_000;
   private transient var lastCleanup : Nat64 = 0;
@@ -476,7 +499,7 @@ private func getDeveloperTierText(owner: Principal) : Text {
     };
     
     // Try with suffixes: _1, _2, _3, etc.
-    // Max 12 chars total, so we need to truncate if adding suffix would exceed
+    // Max 16 chars total, so we need to truncate if adding suffix would exceed
     var suffix : Nat = 1;
     let maxSuffix : Nat = 99;
     
@@ -484,8 +507,8 @@ private func getDeveloperTierText(owner: Principal) : Text {
       let suffixText = "_" # Nat.toText(suffix);
       let suffixLen = Text.size(suffixText);
       
-      // Truncate base name if needed to fit within 12 chars
-      let maxBaseLen = 12 - suffixLen;
+      // Truncate base name if needed to fit within 16 chars
+      let maxBaseLen = 16 - suffixLen;
       var baseName = desiredNickname;
       if (Text.size(baseName) > maxBaseLen) {
         // Take first maxBaseLen chars
@@ -1446,19 +1469,24 @@ private func createDefaultScoreboards(gameId : Text, owner : Principal) : () {
     };
   };
 
+  // Sweeps games whose 30-day recovery window has fully expired: removes them
+  // from BOTH the recovery map AND the live games map (the old version only
+  // touched deletedGames and had an impossible `not canRecover` guard, so expired
+  // games accumulated forever). Safe to call opportunistically from hot paths.
   func cleanupDeletedGames() {
-    let now = Nat64.fromNat(Int.abs(Time.now()));
-    
+    let nowT = Nat64.fromNat(Int.abs(Time.now()));
+
     let toRemove = Buffer.Buffer<Text>(0);
-    
+
     for ((gameId, deleted) in deletedGames.entries()) {
-      if (now > deleted.permanentDeletionAt and not deleted.canRecover) {
+      if (nowT > deleted.permanentDeletionAt) {
         toRemove.add(gameId);
       };
     };
-    
+
     for (gameId in toRemove.vals()) {
-      deletedGames.delete(gameId);
+      games.delete(gameId);        // remove the (inactive) record from the live map
+      deletedGames.delete(gameId); // remove the recovery record
     };
   };
 
@@ -1470,6 +1498,12 @@ private func createDefaultScoreboards(gameId : Text, owner : Principal) : () {
     if (not checkDeleteRateLimit(msg.caller)) {
       return #err("Rate limit exceeded. You can only delete 3 games per hour. Please try again later.");
     };
+
+    // Opportunistic sweep: remove any games whose 30-day recovery window has
+    // expired (both from games and deletedGames). Runs as a side effect of normal
+    // activity since IC canisters can't self-schedule cron. Cheap: iterates only
+    // the deletedGames map, which is small.
+    cleanupDeletedGames();
     
     switch (games.get(gameId)) {
       case (?game) {
@@ -2376,6 +2410,7 @@ private func repairMigratedStreaksInternal(dryRun : Bool) : Text {
     
     stableSessions := Iter.toArray(sessions.entries());
     stableSuspicionLog := List.toArray(suspicionLog);
+    stableEntryDeletionLog := List.toArray(entryDeletionLog);
     stableFiles := List.toArray(files);
     stableAnalyticsEvents := Buffer.toArray(analyticsEvents);
     stableDailyStats := Iter.toArray(dailyStats.entries());
@@ -2407,6 +2442,10 @@ private func repairMigratedStreaksInternal(dryRun : Bool) : Text {
 };
 
 system func postupgrade() {
+    // Force VERIFIER to the current source value, overriding any stale value
+    // persisted in stable memory (top-level vars in a persistent actor survive
+    // upgrades, so editing the declaration alone is not enough).
+    VERIFIER := Principal.fromText(VERIFIER_PRINCIPAL);
     
     usersByEmail := HashMap.HashMap<Text, UserProfile>(10, Text.equal, Text.hash);
     for ((e, prof) in stableUsersByEmail.vals()) { usersByEmail.put(e, prof) };
@@ -2587,6 +2626,7 @@ system func postupgrade() {
     for ((key, time) in stableLastSubmitTime.vals()) { lastSubmitTime.put(key, time) };
 
     suspicionLog := List.fromArray(stableSuspicionLog);
+    entryDeletionLog := List.fromArray(stableEntryDeletionLog);
     files := List.fromArray(stableFiles);
     
     analyticsEvents := Buffer.fromArray<AnalyticsEvent>(stableAnalyticsEvents);
@@ -2681,7 +2721,7 @@ system func postupgrade() {
     );
     playSessionsStable := [];
 
-    // REPLACE WITH YOUR initial admin principal (can be same as CONTROLLER).
+    // Bootstrap SuperAdmin. REPLACE with your admin principal before deploying.
     let firstAdmin = Principal.fromText("aaaaa-aa");
     adminRoles.put(firstAdmin, #SuperAdmin);
 
@@ -3810,8 +3850,10 @@ public shared(msg) func registerGame(
   };
 
   public query func getGamesByOwner(owner : Principal) : async [GameInfo] {
+    // Filter out soft-deleted (inactive) games so a deleted game stops showing in
+    // the dashboard — matches getGamesBySession, which already filters isActive.
     Iter.toArray(
-      Iter.filter(games.vals(), func (g : GameInfo) : Bool { g.owner == owner })
+      Iter.filter(games.vals(), func (g : GameInfo) : Bool { g.owner == owner and g.isActive })
     )
   };
 
@@ -4413,8 +4455,9 @@ public shared func revokeApiKeyBySession(
     
     let caller = msg.caller;
     
-    if (Text.size(nickname) < 2 or Text.size(nickname) > 12) {
-      return #err("Nickname must be 2-12 characters");
+    switch (validateNickname(nickname)) {
+      case (#err(e)) { return #err(e) };
+      case (#ok()) {};
     };
     
     if (Principal.isAnonymous(caller)) {
@@ -4497,9 +4540,20 @@ public shared func revokeApiKeyBySession(
       play_count : Nat;
     };
   }, Text> {
-    
-    if (Text.size(nickname) < 2 or Text.size(nickname) > 12) {
-      return #err("Nickname must be 2-12 characters");
+
+    // SECURITY: this mints a fully-privileged session from a bare `email` string.
+    // The caller MUST be the trusted verifier (same gate as
+    // createSessionForVerifiedUser). Without this, anyone can call the canister
+    // directly with any developer's email and receive a valid session for it,
+    // taking over the account. The verifier is responsible for validating the
+    // Google/Apple token before calling this with the verified email.
+    if (msg.caller != VERIFIER) {
+       return #err("Unauthorized: login must go through the verifier");
+     };
+
+    switch (validateNickname(nickname)) {
+      case (#err(e)) { return #err(e) };
+      case (#ok()) {};
     };
     
     let authType = if (provider == "google") { #google } else { #apple };
@@ -4543,7 +4597,10 @@ public shared func revokeApiKeyBySession(
       lastUsed = now();
     };
     sessions.put(sessionId, session);
-    principalToSession.put(Principal.toText(msg.caller), sessionId);
+    // Removed: principalToSession.put(Principal.toText(msg.caller), sessionId);
+    // The caller is always VERIFIER now, so this only ever mapped VERIFIER -> the
+    // most recent session (last-writer-wins), and nothing in the canister reads
+    // this map (it is write-only aside from the upgrade snapshot). Dropping it.
 
     var gameProfile : ?{
       total_score : Nat64;
@@ -4972,7 +5029,7 @@ public shared func revokeApiKeyBySession(
       // Use provided nickname or generate default
       let playerNickname = switch (nickname) {
         case (?n) { 
-          if (Text.size(n) >= 2 and Text.size(n) <= 20 and not isNicknameTaken(n, null)) { n } 
+          if (Result.isOk(validateNickname(n)) and not isNicknameTaken(n, null)) { n } 
           else { "Player_" # Nat.toText(userIdCounter) }
         };
         case null { "Player_" # Nat.toText(userIdCounter) };
@@ -5001,7 +5058,7 @@ public shared func revokeApiKeyBySession(
     
     switch (user, nickname) {
       case (?u, ?n) {
-        if (n != u.nickname and Text.size(n) >= 2 and Text.size(n) <= 20 and not isNicknameTaken(n, ?u.identifier)) {
+        if (n != u.nickname and Result.isOk(validateNickname(n)) and not isNicknameTaken(n, ?u.identifier)) {
           let updatedWithNickname : UserProfile = {
             identifier = u.identifier;
             nickname = n;
@@ -5320,7 +5377,7 @@ public shared func revokeApiKeyBySession(
       userIdCounter += 1;
       let playerNickname = switch (nickname) {
         case (?n) {
-          if (Text.size(n) >= 2 and Text.size(n) <= 20 and not isNicknameTaken(n, null)) { n }
+          if (Result.isOk(validateNickname(n)) and not isNicknameTaken(n, null)) { n }
           else { "Player_" # Nat.toText(userIdCounter) }
         };
         case null { "Player_" # Nat.toText(userIdCounter) };
@@ -5342,7 +5399,7 @@ public shared func revokeApiKeyBySession(
       case (?u) {
         let effectiveNick = switch (nickname) {
           case (?n) {
-            if (n != u.nickname and Text.size(n) >= 2 and Text.size(n) <= 20 and not isNicknameTaken(n, ?u.identifier)) {
+            if (n != u.nickname and Result.isOk(validateNickname(n)) and not isNicknameTaken(n, ?u.identifier)) {
               putUserByIdentifier({
                 identifier = u.identifier;
                 nickname = n;
@@ -5402,6 +5459,502 @@ public shared func revokeApiKeyBySession(
   };
 
 
+
+  // ════════════════════════════════════════════════════════════════════════════
+  // DEV BOARD MODERATION (entry deletion)
+  // ════════════════════════════════════════════════════════════════════════════
+  // Devs can remove entries from their own boards via the dashboard. playerKey
+  // is an opaque hash of the player identifier, so identifiers (emails,
+  // principals) are never exposed to game owners or clients. Deletion is not
+  // a ban — the player can resubmit. Per-game blocklist is planned as v2.
+
+  private func playerKeyOf(id : UserIdentifier) : Text {
+    Nat32.toText(Text.hash(identifierToText(id)))
+  };
+
+  private func logEntryDeletion(
+    caller : Principal, gameId : Text, scope : Text, playerKey : Text,
+    nickname : Text, liveRemoved : Nat, archiveRemoved : Nat, profileReset : Bool
+  ) {
+    entryDeletionLog := List.push({
+      caller = caller;
+      gameId = gameId;
+      scope = scope;
+      playerKey = playerKey;
+      nickname = nickname;
+      liveRemoved = liveRemoved;
+      archiveRemoved = archiveRemoved;
+      profileReset = profileReset;
+      timestamp = now();
+    }, entryDeletionLog);
+    // Cap so the log can't grow unbounded
+    if (List.size(entryDeletionLog) > 2000) {
+      entryDeletionLog := List.take(entryDeletionLog, 2000);
+    };
+  };
+
+  /// Query-safe variant: validates the session without the expired-session
+  /// cleanup delete (queries can't mutate). Expiry is still enforced; the
+  /// cleanup happens on the next update call instead.
+  private func ownerForGameFromSessionQuery(sessionId : Text, gameId : Text) : Result.Result<Principal, Text> {
+    switch (sessions.get(sessionId)) {
+      case null { #err("Invalid or expired session") };
+      case (?session) {
+        let currentTime = Nat64.fromNat(Int.abs(Time.now()));
+        if (session.expires < currentTime) {
+          return #err("Session expired");
+        };
+        let owner = emailToPrincipalSimple(session.email);
+        switch (games.get(gameId)) {
+          case null { #err("Game not found") };
+          case (?game) {
+            if (not Principal.equal(game.owner, owner)) {
+              #err("Unauthorized: you don't own this game")
+            } else { #ok(owner) }
+          };
+        };
+      };
+    };
+  };
+
+  /// Shared owner check for the BySession moderation endpoints.
+  private func ownerForGameFromSession(sessionId : Text, gameId : Text) : Result.Result<Principal, Text> {
+    switch (getOwnerFromSession(sessionId)) {
+      case (#err(e)) { #err(e) };
+      case (#ok(owner)) {
+        switch (games.get(gameId)) {
+          case null { #err("Game not found") };
+          case (?game) {
+            if (not Principal.equal(game.owner, owner)) {
+              #err("Unauthorized: you don't own this game")
+            } else { #ok(owner) }
+          };
+        };
+      };
+    };
+  };
+
+  /// Remove all of playerKey's entries from one live board.
+  /// Returns (removed count, sample removed entry for nickname/identifier).
+  private func removePlayerFromLiveBoard(key : Text, playerKey : Text) : (Nat, ?ScoreEntry) {
+    switch (scoreboardEntries.get(key)) {
+      case null { (0, null) };
+      case (?buf) {
+        var sample : ?ScoreEntry = null;
+        let keep = Buffer.Buffer<ScoreEntry>(buf.size());
+        for (e in buf.vals()) {
+          if (playerKeyOf(e.odentifier) == playerKey) {
+            sample := ?e;
+          } else {
+            keep.add(e);
+          };
+        };
+        let removed : Nat = buf.size() - keep.size();
+        if (removed > 0) {
+          scoreboardEntries.put(key, keep);
+          // Bust the read cache so the row disappears immediately
+          cachedScoreboards.delete(key);
+          scoreboardLastUpdate.delete(key);
+        };
+        (removed, sample)
+      };
+    };
+  };
+
+  /// Remove playerKey's rows from archives. scoreboardId = null → all boards
+  /// of the game. Collects updates first, then applies (no mutation while
+  /// iterating). Returns archived rows removed.
+  private func purgeArchivedRows(gameId : Text, scoreboardId : ?Text, playerKey : Text) : Nat {
+    var total : Nat = 0;
+    let updates = Buffer.Buffer<(Text, ArchivedScoreboard)>(4);
+    for ((key, archive) in scoreboardArchives.entries()) {
+      let boardMatches = switch (scoreboardId) {
+        case (?sbId) { archive.gameId == gameId and archive.scoreboardId == sbId };
+        case null { archive.gameId == gameId };
+      };
+      if (boardMatches) {
+        let kept = Array.filter<ScoreEntry>(archive.entries, func(e : ScoreEntry) : Bool { playerKeyOf(e.odentifier) != playerKey });
+        let removed : Nat = archive.entries.size() - kept.size();
+        if (removed > 0) {
+          updates.add((key, {
+            scoreboardId = archive.scoreboardId;
+            gameId = archive.gameId;
+            name = archive.name;
+            period = archive.period;
+            sortBy = archive.sortBy;
+            periodStart = archive.periodStart;
+            periodEnd = archive.periodEnd;
+            entries = kept;
+            totalEntries = kept.size();
+          }));
+          total += removed;
+        };
+      };
+    };
+    for ((key, updated) in updates.vals()) { scoreboardArchives.put(key, updated) };
+    total
+  };
+
+  /// Find a sample entry for a playerKey by scanning the game's live boards,
+  /// then archives. Needed to resolve the real identifier for profile resets.
+  private func resolveEntryByPlayerKey(gameId : Text, playerKey : Text) : ?ScoreEntry {
+    for ((key, config) in scoreboardConfigs.entries()) {
+      if (config.gameId == gameId) {
+        switch (scoreboardEntries.get(key)) {
+          case (?buf) {
+            for (e in buf.vals()) {
+              if (playerKeyOf(e.odentifier) == playerKey) { return ?e };
+            };
+          };
+          case null {};
+        };
+      };
+    };
+    for ((_, archive) in scoreboardArchives.entries()) {
+      if (archive.gameId == gameId) {
+        for (e in archive.entries.vals()) {
+          if (playerKeyOf(e.odentifier) == playerKey) { return ?e };
+        };
+      };
+    };
+    null
+  };
+
+  /// Zero a player's aggregate profile for one game (score, streak,
+  /// play_count). Achievements are kept. Returns true if a profile was reset.
+  private func resetGameProfile(identifier : UserIdentifier, gameId : Text) : Bool {
+    switch (getUserByIdentifier(identifier)) {
+      case null { false };
+      case (?u) {
+        var touched = false;
+        let profs = Buffer.Buffer<(Text, GameProfile)>(u.gameProfiles.size());
+        for ((gId, gp) in u.gameProfiles.vals()) {
+          if (gId == gameId) {
+            profs.add((gId, {
+              gameId = gp.gameId;
+              total_score = 0;
+              best_streak = 0;
+              achievements = gp.achievements;
+              last_played = gp.last_played;
+              play_count = 0;
+            }));
+            touched := true;
+          } else {
+            profs.add((gId, gp));
+          };
+        };
+        if (touched) {
+          putUserByIdentifier({
+            identifier = u.identifier;
+            nickname = u.nickname;
+            authType = u.authType;
+            gameProfiles = Buffer.toArray(profs);
+            created = u.created;
+            last_updated = now();
+          });
+        };
+        touched
+      };
+    };
+  };
+
+  /// Dashboard: board rows with opaque playerKey handles for moderation.
+  public shared query func getScoreboardAdminBySession(
+    sessionId : Text,
+    gameId : Text,
+    scoreboardId : Text
+  ) : async Result.Result<[{
+    playerKey : Text;
+    nickname : Text;
+    score : Nat64;
+    streak : Nat64;
+    submittedAt : Nat64;
+    authType : Text;
+    rank : Nat;
+  }], Text> {
+    switch (ownerForGameFromSessionQuery(sessionId, gameId)) {
+      case (#err(e)) { return #err(e) };
+      case (#ok(_)) {};
+    };
+    let key = makeScoreboardKey(gameId, scoreboardId);
+    switch (scoreboardConfigs.get(key)) {
+      case null { #err("Scoreboard not found") };
+      case (?config) {
+        let entries = switch (scoreboardEntries.get(key)) {
+          case null { [] : [ScoreEntry] };
+          case (?buf) { Scoreboards.sortEntries(Buffer.toArray(buf), config.sortBy) };
+        };
+        let out = Buffer.Buffer<{
+          playerKey : Text;
+          nickname : Text;
+          score : Nat64;
+          streak : Nat64;
+          submittedAt : Nat64;
+          authType : Text;
+          rank : Nat;
+        }>(entries.size());
+        var rank : Nat = 1;
+        for (e in entries.vals()) {
+          out.add({
+            playerKey = playerKeyOf(e.odentifier);
+            nickname = e.nickname;
+            score = e.score;
+            streak = e.streak;
+            submittedAt = e.submittedAt;
+            authType = authTypeToText(e.authType);
+            rank = rank;
+          });
+          rank += 1;
+        };
+        #ok(Buffer.toArray(out))
+      };
+    };
+  };
+
+  /// Dashboard: delete one player's entry from one board.
+  public shared func removeScoreEntryBySession(
+    sessionId : Text,
+    gameId : Text,
+    scoreboardId : Text,
+    playerKey : Text,
+    purgeArchives : Bool
+  ) : async Result.Result<Text, Text> {
+    switch (ownerForGameFromSession(sessionId, gameId)) {
+      case (#err(e)) { return #err(e) };
+      case (#ok(owner)) {
+        let key = makeScoreboardKey(gameId, scoreboardId);
+        if (Option.isNull(scoreboardConfigs.get(key))) {
+          return #err("Scoreboard not found");
+        };
+        let (removed, sample) = removePlayerFromLiveBoard(key, playerKey);
+        let archiveRemoved = if (purgeArchives) {
+          purgeArchivedRows(gameId, ?scoreboardId, playerKey)
+        } else { 0 };
+        if (removed == 0 and archiveRemoved == 0) {
+          return #err("No entries found for that player on this board");
+        };
+        let nickname = switch (sample) {
+          case (?e) { e.nickname };
+          case null { "player" };
+        };
+        logEntryDeletion(owner, gameId, scoreboardId, playerKey, nickname, removed, archiveRemoved, false);
+        #ok("Removed " # Nat.toText(removed) # " live and " # Nat.toText(archiveRemoved) # " archived entries for " # nickname)
+      };
+    };
+  };
+
+  /// Dashboard: wipe a player's entries from every board in the game,
+  /// optionally archives too, and reset their aggregate game profile.
+  public shared func removePlayerScoresBySession(
+    sessionId : Text,
+    gameId : Text,
+    playerKey : Text,
+    purgeArchives : Bool
+  ) : async Result.Result<Text, Text> {
+    switch (ownerForGameFromSession(sessionId, gameId)) {
+      case (#err(e)) { return #err(e) };
+      case (#ok(owner)) {
+        // Resolve identifier BEFORE deleting (entries are the only mapping)
+        let sample = resolveEntryByPlayerKey(gameId, playerKey);
+
+        let boardKeys = Buffer.Buffer<Text>(8);
+        for ((key, config) in scoreboardConfigs.entries()) {
+          if (config.gameId == gameId) { boardKeys.add(key) };
+        };
+        var liveRemoved : Nat = 0;
+        for (key in boardKeys.vals()) {
+          let (n, _) = removePlayerFromLiveBoard(key, playerKey);
+          liveRemoved += n;
+        };
+        let archiveRemoved = if (purgeArchives) {
+          purgeArchivedRows(gameId, null, playerKey)
+        } else { 0 };
+
+        var profileReset = false;
+        switch (sample) {
+          case (?e) { profileReset := resetGameProfile(e.odentifier, gameId) };
+          case null {};
+        };
+
+        if (liveRemoved == 0 and archiveRemoved == 0 and not profileReset) {
+          return #err("No entries found for that player in this game");
+        };
+        let nickname = switch (sample) {
+          case (?e) { e.nickname };
+          case null { "player" };
+        };
+        logEntryDeletion(owner, gameId, "ALL", playerKey, nickname, liveRemoved, archiveRemoved, profileReset);
+        #ok("Removed " # Nat.toText(liveRemoved) # " live and " # Nat.toText(archiveRemoved) # " archived entries for " # nickname # (if (profileReset) { "; profile stats reset" } else { "" }))
+      };
+    };
+  };
+
+  /// Dashboard: the game's deletion audit log (newest first).
+  public shared query func getEntryDeletionLogBySession(
+    sessionId : Text,
+    gameId : Text
+  ) : async Result.Result<[EntryDeletionRecord], Text> {
+    switch (ownerForGameFromSessionQuery(sessionId, gameId)) {
+      case (#err(e)) { return #err(e) };
+      case (#ok(_)) {};
+    };
+    let out = Buffer.Buffer<EntryDeletionRecord>(16);
+    for (rec in List.toArray(entryDeletionLog).vals()) {
+      if (rec.gameId == gameId) { out.add(rec) };
+    };
+    #ok(Buffer.toArray(out))
+  };
+
+  // ── Principal-authenticated twins (Internet Identity dashboard devs) ──
+
+  private func requireGameOwner(caller : Principal, gameId : Text) : Result.Result<(), Text> {
+    if (Principal.isAnonymous(caller)) {
+      return #err("Authentication required");
+    };
+    switch (games.get(gameId)) {
+      case null { #err("Game not found") };
+      case (?game) {
+        if (not Principal.equal(game.owner, caller)) {
+          #err("Unauthorized: you don't own this game")
+        } else { #ok(()) }
+      };
+    };
+  };
+
+  public shared query(msg) func getScoreboardAdmin(
+    gameId : Text,
+    scoreboardId : Text
+  ) : async Result.Result<[{
+    playerKey : Text;
+    nickname : Text;
+    score : Nat64;
+    streak : Nat64;
+    submittedAt : Nat64;
+    authType : Text;
+    rank : Nat;
+  }], Text> {
+    switch (requireGameOwner(msg.caller, gameId)) {
+      case (#err(e)) { return #err(e) };
+      case (#ok()) {};
+    };
+    let key = makeScoreboardKey(gameId, scoreboardId);
+    switch (scoreboardConfigs.get(key)) {
+      case null { #err("Scoreboard not found") };
+      case (?config) {
+        let entries = switch (scoreboardEntries.get(key)) {
+          case null { [] : [ScoreEntry] };
+          case (?buf) { Scoreboards.sortEntries(Buffer.toArray(buf), config.sortBy) };
+        };
+        let out = Buffer.Buffer<{
+          playerKey : Text;
+          nickname : Text;
+          score : Nat64;
+          streak : Nat64;
+          submittedAt : Nat64;
+          authType : Text;
+          rank : Nat;
+        }>(entries.size());
+        var rank : Nat = 1;
+        for (e in entries.vals()) {
+          out.add({
+            playerKey = playerKeyOf(e.odentifier);
+            nickname = e.nickname;
+            score = e.score;
+            streak = e.streak;
+            submittedAt = e.submittedAt;
+            authType = authTypeToText(e.authType);
+            rank = rank;
+          });
+          rank += 1;
+        };
+        #ok(Buffer.toArray(out))
+      };
+    };
+  };
+
+  public shared(msg) func removeScoreEntry(
+    gameId : Text,
+    scoreboardId : Text,
+    playerKey : Text,
+    purgeArchives : Bool
+  ) : async Result.Result<Text, Text> {
+    switch (requireGameOwner(msg.caller, gameId)) {
+      case (#err(e)) { return #err(e) };
+      case (#ok()) {};
+    };
+    let key = makeScoreboardKey(gameId, scoreboardId);
+    if (Option.isNull(scoreboardConfigs.get(key))) {
+      return #err("Scoreboard not found");
+    };
+    let (removed, sample) = removePlayerFromLiveBoard(key, playerKey);
+    let archiveRemoved = if (purgeArchives) {
+      purgeArchivedRows(gameId, ?scoreboardId, playerKey)
+    } else { 0 };
+    if (removed == 0 and archiveRemoved == 0) {
+      return #err("No entries found for that player on this board");
+    };
+    let nickname = switch (sample) {
+      case (?e) { e.nickname };
+      case null { "player" };
+    };
+    logEntryDeletion(msg.caller, gameId, scoreboardId, playerKey, nickname, removed, archiveRemoved, false);
+    #ok("Removed " # Nat.toText(removed) # " live and " # Nat.toText(archiveRemoved) # " archived entries for " # nickname)
+  };
+
+  public shared(msg) func removePlayerScores(
+    gameId : Text,
+    playerKey : Text,
+    purgeArchives : Bool
+  ) : async Result.Result<Text, Text> {
+    switch (requireGameOwner(msg.caller, gameId)) {
+      case (#err(e)) { return #err(e) };
+      case (#ok()) {};
+    };
+    let sample = resolveEntryByPlayerKey(gameId, playerKey);
+
+    let boardKeys = Buffer.Buffer<Text>(8);
+    for ((key, config) in scoreboardConfigs.entries()) {
+      if (config.gameId == gameId) { boardKeys.add(key) };
+    };
+    var liveRemoved : Nat = 0;
+    for (key in boardKeys.vals()) {
+      let (n, _) = removePlayerFromLiveBoard(key, playerKey);
+      liveRemoved += n;
+    };
+    let archiveRemoved = if (purgeArchives) {
+      purgeArchivedRows(gameId, null, playerKey)
+    } else { 0 };
+
+    var profileReset = false;
+    switch (sample) {
+      case (?e) { profileReset := resetGameProfile(e.odentifier, gameId) };
+      case null {};
+    };
+
+    if (liveRemoved == 0 and archiveRemoved == 0 and not profileReset) {
+      return #err("No entries found for that player in this game");
+    };
+    let nickname = switch (sample) {
+      case (?e) { e.nickname };
+      case null { "player" };
+    };
+    logEntryDeletion(msg.caller, gameId, "ALL", playerKey, nickname, liveRemoved, archiveRemoved, profileReset);
+    #ok("Removed " # Nat.toText(liveRemoved) # " live and " # Nat.toText(archiveRemoved) # " archived entries for " # nickname # (if (profileReset) { "; profile stats reset" } else { "" }))
+  };
+
+  public shared query(msg) func getEntryDeletionLog(
+    gameId : Text
+  ) : async Result.Result<[EntryDeletionRecord], Text> {
+    switch (requireGameOwner(msg.caller, gameId)) {
+      case (#err(e)) { return #err(e) };
+      case (#ok()) {};
+    };
+    let out = Buffer.Buffer<EntryDeletionRecord>(16);
+    for (rec in List.toArray(entryDeletionLog).vals()) {
+      if (rec.gameId == gameId) { out.add(rec) };
+    };
+    #ok(Buffer.toArray(out))
+  };
 
   // ════════════════════════════════════════════════════════════════════════════
   // PLAY SESSION ENDPOINTS (Time Validation)
@@ -7405,16 +7958,22 @@ public shared func revokeApiKeyBySession(
     fileCount : Nat;
     suspicionLogSize : Nat;
     apiKeyCount : Nat;
+    totalSubmissions : Nat;
   } {
+    // Count only active (non-soft-deleted) games for the public site figure.
+    var activeGames : Nat = 0;
+    for ((_, g) in games.entries()) { if (g.isActive) { activeGames += 1 } };
+    let submissionsTotal = totalSubmissions;
     {
       emailUserCount = usersByEmail.size();
       principalUserCount = usersByPrincipal.size();
-      gameCount = games.size();
+      gameCount = activeGames;
       totalEvents = analyticsEvents.size();
       activeDays = dailyStats.size();
       fileCount = List.size(files);
       suspicionLogSize = List.size(suspicionLog);
       apiKeyCount = apiKeys.size();
+      totalSubmissions = submissionsTotal;
     }
   };
 
@@ -7829,11 +8388,14 @@ public shared func revokeApiKeyBySession(
           var count = 0;
           
           for ((userId, deleted) in deletedUsers.entries()) {
-            let daysRemaining = (deleted.permanentDeletionAt - now()) / 86_400_000_000_000;
+            let nowTime = now();
+            let daysRemaining : Nat64 = if (deleted.permanentDeletionAt > nowTime) {
+              (deleted.permanentDeletionAt - nowTime) / 86_400_000_000_000
+            } else { 0 };
             result := result # "\n" # userId # "\n" #
-                     "  Deleted: " # Nat64.toText(deleted.deletedAt) # "\n" #
-                     "  Days until permanent: " # Nat64.toText(daysRemaining) # "\n" #
-                     "  Can recover: " # (if (deleted.canRecover) "✅" else "❌") # "\n";
+                    "  Deleted: " # Nat64.toText(deleted.deletedAt) # "\n" #
+                    "  Days until permanent: " # Nat64.toText(daysRemaining) # "\n" #
+                    "  Can recover: " # (if (deleted.canRecover) "✅" else "❌") # "\n";
             count += 1;
           };
           
@@ -9078,16 +9640,18 @@ case ("listDeletedGames") {
         var count = 0;
         
         for ((gameId, deleted) in deletedGames.entries()) {
-            let currentTime = Nat64.fromNat(Int.abs(Time.now()));
-            let daysRemaining = (deleted.permanentDeletionAt - currentTime) / 86_400_000_000_000;
-            
-            result := result # "\n" # gameId # "\n" #
-                     "  Name: " # deleted.game.name # "\n" #
-                     "  Owner: " # Principal.toText(deleted.game.owner) # "\n" #
-                     "  Reason: " # deleted.reason # "\n" #
-                     "  Days remaining: " # Nat64.toText(daysRemaining) # "\n";
-            count += 1;
-        };
+          let currentTime = Nat64.fromNat(Int.abs(Time.now()));
+          let daysRemaining : Nat64 = if (deleted.permanentDeletionAt > currentTime) {
+            (deleted.permanentDeletionAt - currentTime) / 86_400_000_000_000
+          } else { 0 };
+          
+          result := result # "\n" # gameId # "\n" #
+                  "  Name: " # deleted.game.name # "\n" #
+                  "  Owner: " # Principal.toText(deleted.game.owner) # "\n" #
+                  "  Reason: " # deleted.reason # "\n" #
+                  "  Days remaining: " # Nat64.toText(daysRemaining) # "\n";
+          count += 1;
+      };
         
         if (count == 0) {
             result := result # "\nNo deleted games in grace period.";
@@ -9288,6 +9852,193 @@ case ("downgradeDeveloper") {
         }
       };
       
+      // ═══════════════════════════════════════════════════════════════════
+      // GAME INSIGHT COMMANDS (added 2026-08-13)
+      // ═══════════════════════════════════════════════════════════════════
+
+      case ("topGames") {
+        if (not hasPermission(msg.caller, #Support)) {
+          #err("🔒 Permission denied: Support role required")
+        } else {
+          let limit = if (args.size() > 0) {
+            switch (Nat.fromText(args[0])) { case (?n) n; case null 20 }
+          } else { 20 };
+
+          let arr = Iter.toArray(games.entries());
+          let sorted = Array.sort<(Text, GameInfo)>(arr, func(a, b) {
+            Nat.compare(b.1.totalPlays, a.1.totalPlays)
+          });
+
+          var result = "🏆 TOP GAMES BY PLAYS\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" #
+                       "Total submissions all-time: " # Nat.toText(totalSubmissions) # "\n";
+          var count = 0;
+          for ((gameId, game) in sorted.vals()) {
+            if (count < limit) {
+              let status = if (game.isActive) "✅" else "❌";
+              let share = if (totalSubmissions == 0) { 0 } else {
+                (game.totalPlays * 1000) / totalSubmissions
+              };
+              let shareText = Nat.toText(share / 10) # "." # Nat.toText(share % 10) # "%";
+              result := result # "\n" # status # " " # gameId # " — " # game.name # "\n" #
+                        "  Players: " # Nat.toText(game.totalPlayers) #
+                        "  Plays: " # Nat.toText(game.totalPlays) #
+                        "  Share: " # shareText # "\n";
+              count += 1;
+            };
+          };
+          result := result # "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" #
+                    "Showing top " # Nat.toText(count) # " of " # Nat.toText(arr.size()) # " games\n" #
+                    "(Share = game plays / all-time submissions)";
+          #ok(result)
+        }
+      };
+
+      case ("gameContact") {
+        if (not hasPermission(msg.caller, #Support)) {
+          #err("🔒 Permission denied: Support role required")
+        } else if (args.size() < 1) {
+          #err("Usage: gameContact <gameId>")
+        } else {
+          let gameId = args[0];
+          switch (games.get(gameId)) {
+            case null { #err("❌ Game not found: " # gameId) };
+            case (?game) {
+              var result = "📇 GAME OWNER CONTACT\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" #
+                           "Game: " # game.name # " (" # gameId # ")\n" #
+                           "Owner principal: " # Principal.toText(game.owner) # "\n";
+
+              // Tier
+              let tier = switch (developerTiers.get(game.owner)) {
+                case (?#pro) "⭐ Pro (10 slots)";
+                case _ "Free (3 slots)";
+              };
+              result := result # "Tier: " # tier # "\n";
+
+              var found = false;
+
+              // Direct II / principal-keyed owner
+              switch (usersByPrincipal.get(game.owner)) {
+                case (?user) {
+                  found := true;
+                  result := result # "\n🔑 Principal account:\n" #
+                            "  Nickname: " # user.nickname # "\n" #
+                            "  Auth: " # debug_show(user.authType) # "\n" #
+                            "  Created: " # Nat64.toText(user.created) # "\n";
+                };
+                case null {};
+              };
+
+              // OAuth / session owner: reverse the email→principal hash by scanning keys
+              for ((key, user) in usersByEmail.entries()) {
+                if (Principal.equal(emailToPrincipalSimple(key), game.owner)) {
+                  found := true;
+                  let keyType = if (Text.startsWith(key, #text "ext:")) { "external" }
+                                else if (Text.startsWith(key, #text "dev_")) { "device" }
+                                else { "email" };
+                  result := result # "\n📧 Matched account (" # keyType # "):\n" #
+                            "  Contact: " # key # "\n" #
+                            "  Nickname: " # user.nickname # "\n" #
+                            "  Auth: " # debug_show(user.authType) # "\n" #
+                            "  Created: " # Nat64.toText(user.created) # "\n";
+                };
+              };
+
+              if (not found) {
+                result := result # "\n⚠️ No user record matched this owner principal.\n" #
+                          "(Owner may have registered via a path that left no profile.)";
+              };
+              result := result # "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━";
+              #ok(result)
+            };
+          }
+        }
+      };
+
+      case ("listBoards") {
+        if (not hasPermission(msg.caller, #Support)) {
+          #err("🔒 Permission denied: Support role required")
+        } else if (args.size() < 1) {
+          #err("Usage: listBoards <gameId>")
+        } else {
+          let gameId = args[0];
+          if (Option.isNull(games.get(gameId))) {
+            return #err("❌ Game not found: " # gameId);
+          };
+          var result = "📋 SCOREBOARDS — " # gameId # "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
+          var count = 0;
+          for ((key, config) in scoreboardConfigs.entries()) {
+            if (config.gameId == gameId) {
+              let entryCount = switch (scoreboardEntries.get(key)) {
+                case (?buf) { buf.size() };
+                case null { 0 };
+              };
+              let status = if (config.isActive) "✅" else "❌";
+              result := result # "\n" # status # " " # config.scoreboardId # " — " # config.name # "\n" #
+                        "  Period: " # periodToText(config.period) #
+                        "  Entries: " # Nat.toText(entryCount) # "/" # Nat.toText(config.maxEntries) # "\n";
+              count += 1;
+            };
+          };
+          if (count == 0) {
+            result := result # "\nNo scoreboards found for this game.";
+          } else {
+            result := result # "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" #
+                      Nat.toText(count) # " boards";
+          };
+          #ok(result)
+        }
+      };
+
+      case ("viewBoard") {
+        if (not hasPermission(msg.caller, #Support)) {
+          #err("🔒 Permission denied: Support role required")
+        } else if (args.size() < 2) {
+          #err("Usage: viewBoard <gameId> <scoreboardId> [limit]")
+        } else {
+          let gameId = args[0];
+          let scoreboardId = args[1];
+          let limit = if (args.size() > 2) {
+            switch (Nat.fromText(args[2])) { case (?n) n; case null 20 }
+          } else { 20 };
+
+          let key = makeScoreboardKey(gameId, scoreboardId);
+          switch (scoreboardConfigs.get(key)) {
+            case null { #err("❌ Scoreboard not found: " # gameId # " / " # scoreboardId) };
+            case (?config) {
+              let entries = switch (scoreboardEntries.get(key)) {
+                case null { [] : [ScoreEntry] };
+                case (?buf) { Scoreboards.sortEntries(Buffer.toArray(buf), config.sortBy) };
+              };
+              let t = now();
+              var result = "🔎 BOARD ENTRIES — " # gameId # " / " # scoreboardId # "\n" #
+                           "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" #
+                           "Total entries: " # Nat.toText(entries.size()) # "\n";
+              var rank : Nat = 1;
+              label show for (e in entries.vals()) {
+                if (rank > limit) { break show };
+                let ageNs : Nat64 = if (t > e.submittedAt) { t - e.submittedAt } else { 0 };
+                let ageSecs = Nat64.toNat(ageNs / 1_000_000_000);
+                let age = if (ageSecs < 60) { Nat.toText(ageSecs) # "s ago" }
+                          else if (ageSecs < 3600) { Nat.toText(ageSecs / 60) # "m ago" }
+                          else if (ageSecs < 86400) { Nat.toText(ageSecs / 3600) # "h ago" }
+                          else { Nat.toText(ageSecs / 86400) # "d ago" };
+                result := result # "\n#" # Nat.toText(rank) # " " # e.nickname #
+                          " — score " # Nat64.toText(e.score) #
+                          "  streak " # Nat64.toText(e.streak) # "\n" #
+                          "  " # age # "  [" # authTypeToText(e.authType) # "]" #
+                          "  key: " # playerKeyOf(e.odentifier) # "\n";
+                rank += 1;
+              };
+              result := result # "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" #
+                        "Showing " # Nat.toText(Nat.min(limit, entries.size())) #
+                        " of " # Nat.toText(entries.size()) # " (sorted by " #
+                        (switch (config.sortBy) { case (#score) "score"; case (#streak) "streak" }) # ")";
+              #ok(result)
+            };
+          }
+        }
+      };
+
       case ("help") {
         #ok("📚 ADMIN COMMANDS\n" #
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" #
@@ -9316,6 +10067,11 @@ case ("downgradeDeveloper") {
             "  • getStats\n" #
             "  • listAdmins\n" #
             "  • auditLog [limit]\n" #
+            "\n🎮 Game Insight (Support+)\n" #
+            "  • topGames [limit]\n" #
+            "  • gameContact <gameId>\n" #
+            "  • listBoards <gameId>\n" #
+            "  • viewBoard <gameId> <scoreboardId> [limit]\n" #
             "\n⚠️ Dangerous (SuperAdmin)\n" #
             "  • permanentDelete <userId>\n" #
             "  • repairMigratedStreaks [true|false]  (true=dry-run, default true)\n" #
