@@ -57,8 +57,8 @@ module {
       return #err("Nickname must be at least 3 characters");
     };
     
-    if (length > 12) {
-      return #err("Nickname must be 12 characters or less");
+    if (length > 16) {
+      return #err("Nickname must be 16 characters or less");
     };
     
     let chars = Text.toIter(nickname);

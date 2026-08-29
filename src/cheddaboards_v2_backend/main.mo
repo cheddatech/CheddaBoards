@@ -224,7 +224,8 @@ persistent actor CheddaBoards {
   // NOTE: implicitly stable (persistent actor) — changing this literal after
   // the first deploy has no effect on an upgraded canister; see VERIFIER above.
   private var CONTROLLER : Principal = Principal.fromText("aaaaa-aa");
-  private transient let SESSION_DURATION_NS : Nat64 = 24 * 60 * 60 * 1_000_000_000;
+  // 30 days (was 24h). Sessions also renew on every successful use — see validateSessionInternal.
+  private transient let SESSION_DURATION_NS : Nat64 = 30 * 24 * 60 * 60 * 1_000_000_000;
   private transient var lastCleanup : Nat64 = 0;
   private transient let MAX_GAMES_PER_DEVELOPER : Nat = 3;
   private var adminRolesStable : [(Principal, AdminRole)] = [];
@@ -739,7 +740,10 @@ private func getDeveloperTierText(owner: Principal) : Text {
           return {
             isValid = false;
             playDuration = durationSecs;
-            reason = ?("Played too quickly. Minimum " # Nat64.toText(rules.minPlayDurationSecs) # " seconds required.");
+            // Category only — the configured minimum is the dev's setting and
+            // must not be echoed to clients (INFO-LEAK fix 2026-08-21). Actual
+            // play duration is logged owner-side at the submit call sites.
+            reason = ?"Played too quickly.";
           };
         };
         
@@ -2442,9 +2446,8 @@ private func repairMigratedStreaksInternal(dryRun : Bool) : Text {
 };
 
 system func postupgrade() {
-    // Force VERIFIER to the current source value, overriding any stale value
-    // persisted in stable memory (top-level vars in a persistent actor survive
-    // upgrades, so editing the declaration alone is not enough).
+    // Force VERIFIER to the current source value, overriding any stale persisted
+    // value from stable memory (fixes the old placeholder that survived upgrades).
     VERIFIER := Principal.fromText(VERIFIER_PRINCIPAL);
     
     usersByEmail := HashMap.HashMap<Text, UserProfile>(10, Text.equal, Text.hash);
@@ -2786,6 +2789,27 @@ system func postupgrade() {
 // Replace your existing game management functions with these
 // ═══════════════════════════════════════════════════════════════════════════════
 
+  // ── Game metadata limits ──
+  // transient: in a persistent actor, plain top-level lets become STABLE and
+  // future literal edits would be silently ignored on upgrade (VERIFIER lesson).
+  private transient let MAX_GAME_NAME_LENGTH : Nat = 50;
+  private transient let MAX_GAME_DESCRIPTION_LENGTH : Nat = 200;
+
+  // Silently clamp over-long metadata instead of rejecting, so dashboard
+  // edits of grandfathered games (which resend the old long description)
+  // keep working and REST callers can't stuff junk into stable memory.
+  private func clampText(t : Text, max : Nat) : Text {
+    if (Text.size(t) <= max) { return t };
+    var out = "";
+    var i = 0;
+    label take for (c in t.chars()) {
+      if (i >= max) { break take };
+      out := out # Text.fromChar(c);
+      i += 1;
+    };
+    out
+  };
+
 public shared(msg) func registerGame(
     gameId: Text, 
     name: Text, 
@@ -2815,6 +2839,13 @@ public shared(msg) func registerGame(
         }
       };
       case null {
+        // Charset rule enforced on NEW registrations only, so pre-existing
+        // mixed-case IDs (e.g. Bullet-Candy) are grandfathered: they never
+        // reach this branch and keep resolving via the ?existing case above.
+        if (not isValidGameId(gameId)) {
+          return #err("Invalid game ID format. Use lowercase letters, numbers, and hyphens only.");
+        };
+        
         let currentGameCount = countGamesByOwner(msg.caller);
         
         if (currentGameCount >= MAX_GAMES_PER_DEVELOPER and not isAdmin(msg.caller)) {
@@ -2823,8 +2854,8 @@ public shared(msg) func registerGame(
         
         let gameInfo : GameInfo = {
           gameId = gameId;
-          name = name;
-          description = description;
+          name = clampText(name, MAX_GAME_NAME_LENGTH);
+          description = clampText(description, MAX_GAME_DESCRIPTION_LENGTH);
           owner = msg.caller;
           gameUrl = gameUrl;
           created = now();
@@ -2933,8 +2964,8 @@ public shared(msg) func registerGame(
         
         let updated : GameInfo = {
           gameId = game.gameId;
-          name = name;
-          description = description;
+          name = clampText(name, MAX_GAME_NAME_LENGTH);
+          description = clampText(description, MAX_GAME_DESCRIPTION_LENGTH);
           owner = game.owner;
           gameUrl = gameUrl;
           created = game.created;
@@ -3500,8 +3531,8 @@ public shared(msg) func registerGame(
         
         let newGame : GameInfo = {
           gameId = gameId;
-          name = name;
-          description = description;
+          name = clampText(name, MAX_GAME_NAME_LENGTH);
+          description = clampText(description, MAX_GAME_DESCRIPTION_LENGTH);
           owner = owner;
           gameUrl = gameUrl;
           created = currentTime;
@@ -3562,8 +3593,8 @@ public shared(msg) func registerGame(
             
             let updatedGame : GameInfo = {
               gameId = game.gameId;
-              name = name;
-              description = description;
+              name = clampText(name, MAX_GAME_NAME_LENGTH);
+              description = clampText(description, MAX_GAME_DESCRIPTION_LENGTH);
               owner = game.owner;
               gameUrl = gameUrl;
               created = game.created;
@@ -4396,7 +4427,21 @@ public shared func revokeApiKeyBySession(
           return #err("Session expired");
         };
         
-        #ok(session)
+        // Sliding renewal: every successful use pushes expiry out another full window,
+        // so an active player never expires. (No-op in query contexts — state changes
+        // there are discarded, which is fine; renewal lands on update calls like submits.)
+        let renewed : Session = {
+          sessionId = session.sessionId;
+          email = session.email;
+          nickname = session.nickname;
+          authType = session.authType;
+          created = session.created;
+          expires = currentTime + SESSION_DURATION_NS;
+          lastUsed = currentTime;
+        };
+        sessions.put(sessionId, renewed);
+        
+        #ok(renewed)
       };
     }
   };
@@ -4414,7 +4459,7 @@ public shared func revokeApiKeyBySession(
             nickname = session.nickname;
             authType = session.authType;
             created = session.created;
-            expires = session.expires;
+            expires = now() + SESSION_DURATION_NS; // sliding renewal, same as validateSessionInternal
             lastUsed = now();
           };
           sessions.put(sessionId, updated);
@@ -4543,13 +4588,11 @@ public shared func revokeApiKeyBySession(
 
     // SECURITY: this mints a fully-privileged session from a bare `email` string.
     // The caller MUST be the trusted verifier (same gate as
-    // createSessionForVerifiedUser). Without this, anyone can call the canister
-    // directly with any developer's email and receive a valid session for it,
-    // taking over the account. The verifier is responsible for validating the
-    // Google/Apple token before calling this with the verified email.
+    // createSessionForVerifiedUser). The verifier is responsible for validating
+    // the Google/Apple token before calling this with the verified email.
     if (msg.caller != VERIFIER) {
-       return #err("Unauthorized: login must go through the verifier");
-     };
+      return #err("Unauthorized: login must go through the verifier");
+    };
 
     switch (validateNickname(nickname)) {
       case (#err(e)) { return #err(e) };
@@ -5006,7 +5049,10 @@ public shared func revokeApiKeyBySession(
     switch (validateScore(score, gameId)) {
       case (#err(e)) { 
         logSuspicion(userId # "/" # userIdType, gameId, "Invalid score: " # e);
-        return #err(e);
+        // Detail stays owner-side (anti-cheat log). Echoing the cap to the
+        // client let anyone binary-search a game's limits and submit just
+        // under them (INFO-LEAK fix 2026-08-21).
+        return #err("Score rejected by game validation rules");
       };
       case (#ok()) {};
     };
@@ -5014,7 +5060,7 @@ public shared func revokeApiKeyBySession(
     switch (validateStreak(streak, gameId)) {
       case (#err(e)) {
         logSuspicion(userId # "/" # userIdType, gameId, "Invalid streak: " # e);
-        return #err(e);
+        return #err("Streak rejected by game validation rules");
       };
       case (#ok()) {};
     };
@@ -5101,7 +5147,7 @@ public shared func revokeApiKeyBySession(
               if (not validation.isValid) {
                 switch (validation.reason) {
                   case (?reason) {
-                    logSuspicion(identifierToText(u.identifier), gameId, "Time validation failed: " # reason);
+                    logSuspicion(identifierToText(u.identifier), gameId, "Time validation failed: " # reason # " (played " # Nat64.toText(validation.playDuration) # "s)");
                     return #err(reason);
                   };
                   case null {
@@ -5364,11 +5410,11 @@ public shared func revokeApiKeyBySession(
     };
 
     switch (validateScore(score, gameId)) {
-      case (#err(e)) { logSuspicion(userId # "/" # userIdType, gameId, "Invalid score: " # e); return #err(e) };
+      case (#err(e)) { logSuspicion(userId # "/" # userIdType, gameId, "Invalid score: " # e); return #err("Score rejected by game validation rules") };
       case (#ok()) {};
     };
     switch (validateStreak(streak, gameId)) {
-      case (#err(e)) { logSuspicion(userId # "/" # userIdType, gameId, "Invalid streak: " # e); return #err(e) };
+      case (#err(e)) { logSuspicion(userId # "/" # userIdType, gameId, "Invalid streak: " # e); return #err("Streak rejected by game validation rules") };
       case (#ok()) {};
     };
 
@@ -5434,7 +5480,7 @@ public shared func revokeApiKeyBySession(
               let validation = validatePlaySession(token, u.identifier, gameId, score);
               if (not validation.isValid) {
                 switch (validation.reason) {
-                  case (?reason) { logSuspicion(identifierToText(u.identifier), gameId, "Time validation failed: " # reason); return #err(reason) };
+                  case (?reason) { logSuspicion(identifierToText(u.identifier), gameId, "Time validation failed: " # reason # " (played " # Nat64.toText(validation.playDuration) # "s)"); return #err(reason) };
                   case null { return #err("Play session validation failed.") };
                 };
               };
@@ -6404,6 +6450,145 @@ public shared func revokeApiKeyBySession(
     };
   };
 
+  // Batch unlock: one update call (one consensus round) for the whole batch.
+  // Replaces the proxy's per-achievement await loop, which ran ~1s per ID and
+  // hit Netlify's 30s function cap on ~32-achievement batches (confirmed in
+  // proxy logs 26 Aug 2026). Validation, session check (and its sliding
+  // renewal), user lookup, and the profile rewrite all happen ONCE; per-ID
+  // outcomes are returned so the proxy can keep its existing response shape.
+  public shared(msg) func unlockAchievementBatch(
+    userIdType : Text,
+    userId : Text,
+    gameId : Text,
+    achievementIds : [Text]
+  ) : async Result.Result<{ unlocked : [Text]; alreadyUnlocked : [Text]; failed : [(Text, Text)] }, Text> {
+
+    if (achievementIds.size() == 0) {
+      return #err("No achievement IDs provided");
+    };
+    if (achievementIds.size() > 100) {
+      return #err("Batch too large (max 100 achievements per call)");
+    };
+
+    switch (validateCaller(msg, userIdType, userId)) {
+      case (#err(e)) { return #err(e) };
+      case (#ok(_)) {};
+    };
+
+    let game = switch (games.get(gameId)) {
+      case null { return #err("Game not found: " # gameId) };
+      case (?g) {
+        if (not g.isActive) {
+          return #err("Game is not active");
+        };
+        g
+      };
+    };
+
+    switch (validateAccessMode(game, userIdType)) {
+      case (#err(e)) { return #err(e) };
+      case (#ok(_)) {};
+    };
+
+    let identifier : UserIdentifier = switch (userIdType) {
+      case ("email") {
+        switch (validateSessionInternal(userId)) {
+          case (#err(e)) { return #err(e) };
+          case (#ok(session)) { #email(session.email) };
+        };
+      };
+      case ("session") {
+        switch (validateSessionInternal(userId)) {
+          case (#err(e)) { return #err(e) };
+          case (#ok(session)) { #email(session.email) };
+        };
+      };
+      case ("principal") { #principal(msg.caller) };
+      case ("external") { #email("ext:" # userId) };
+      case (_) { return #err("Invalid user type") };
+    };
+
+    switch (getUserByIdentifier(identifier)) {
+      case null { #err("User not found") };
+      case (?u) {
+        var gameProfiles = Buffer.Buffer<(Text, GameProfile)>(u.gameProfiles.size());
+        var found = false;
+        let unlocked = Buffer.Buffer<Text>(achievementIds.size());
+        let alreadyUnlocked = Buffer.Buffer<Text>(0);
+        let failed = Buffer.Buffer<(Text, Text)>(0);
+
+        for ((gId, gProfile) in u.gameProfiles.vals()) {
+          if (gId == gameId) {
+            found := true;
+
+            // Start from existing achievements; dedupes against both the
+            // stored set and duplicates within the incoming batch.
+            let newAchievements = Buffer.Buffer<Text>(gProfile.achievements.size() + achievementIds.size());
+            for (a in gProfile.achievements.vals()) { newAchievements.add(a) };
+
+            for (achId in achievementIds.vals()) {
+              if (Text.size(achId) == 0) {
+                failed.add((achId, "Achievement ID cannot be empty"));
+              } else {
+                var exists = false;
+                for (a in newAchievements.vals()) {
+                  if (a == achId) { exists := true };
+                };
+                if (exists) {
+                  alreadyUnlocked.add(achId);
+                } else {
+                  newAchievements.add(achId);
+                  unlocked.add(achId);
+                };
+              };
+            };
+
+            let updated : GameProfile = {
+              gameId = gameId;
+              total_score = gProfile.total_score;
+              best_streak = gProfile.best_streak;
+              achievements = Buffer.toArray(newAchievements);
+              last_played = gProfile.last_played;
+              play_count = gProfile.play_count;
+            };
+            gameProfiles.add((gId, updated));
+          } else {
+            gameProfiles.add((gId, gProfile));
+          };
+        };
+
+        if (not found) {
+          return #err("No profile for this game. Play first!");
+        };
+
+        // Only rewrite the user if something actually changed
+        if (unlocked.size() > 0) {
+          let updatedUser : UserProfile = {
+            identifier = u.identifier;
+            nickname = u.nickname;
+            authType = u.authType;
+            gameProfiles = Buffer.toArray(gameProfiles);
+            created = u.created;
+            last_updated = now();
+          };
+          putUserByIdentifier(updatedUser);
+
+          for (achId in unlocked.vals()) {
+            trackEventInternal(u.identifier, gameId, "achievement_unlocked", [
+              ("achievement_id", achId)
+            ]);
+          };
+        };
+
+        #ok({
+          unlocked = Buffer.toArray(unlocked);
+          alreadyUnlocked = Buffer.toArray(alreadyUnlocked);
+          failed = Buffer.toArray(failed);
+        })
+      };
+    };
+  };
+
   public query func getAchievements(userIdType : Text, userId : Text, gameId : Text) : async [Text] {
     let identifier : UserIdentifier = switch (userIdType) {
       case ("email") { #email(userId) };
@@ -6654,8 +6839,8 @@ public shared func revokeApiKeyBySession(
         let config : ScoreboardConfig = {
           scoreboardId = scoreboardId;
           gameId = gameId;
-          name = name;
-          description = description;
+          name = clampText(name, MAX_GAME_NAME_LENGTH);
+          description = clampText(description, MAX_GAME_DESCRIPTION_LENGTH);
           period = period;
           sortBy = sortBy;
           maxEntries = maxEntriesVal;
@@ -6943,7 +7128,7 @@ public shared func revokeApiKeyBySession(
         switch (validateScore(score, gameId)) {
           case (#err(e)) { 
             logSuspicion(playerId, gameId, "Invalid score submission: " # e);
-            return #err(e);
+            return #err("Score rejected by game validation rules");
           };
           case (#ok()) {};
         };
@@ -6951,7 +7136,7 @@ public shared func revokeApiKeyBySession(
         switch (validateStreak(streak, gameId)) {
           case (#err(e)) { 
             logSuspicion(playerId, gameId, "Invalid streak submission: " # e);
-            return #err(e);
+            return #err("Streak rejected by game validation rules");
           };
           case (#ok()) {};
         };
@@ -7359,8 +7544,8 @@ public shared func revokeApiKeyBySession(
     let config : ScoreboardConfig = {
       scoreboardId = scoreboardId;
       gameId = gameId;
-      name = name;
-      description = description;
+      name = clampText(name, MAX_GAME_NAME_LENGTH);
+      description = clampText(description, MAX_GAME_DESCRIPTION_LENGTH);
       period = period;
       sortBy = sortBy;
       maxEntries = maxEntriesVal;

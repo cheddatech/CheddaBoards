@@ -43,8 +43,7 @@ The hosted proxy at cheddaboards.com is not part of this repo — self-hosters b
 
 ## Features
 
-- **Multi-Auth**: Google, Apple, Internet Identity, Anonymous, Device Code (RFC 8628)
-- **Leaderboards**: Real-time, server-validated scores
+- **Multi-Auth**: Google, Apple, Internet Identity, Anonymous. Device-code login (RFC 8628) for linking game clients is implemented in the hosted proxy layer, not in the canister.- **Leaderboards**: Real-time, server-validated scores
 - **Timed Scoreboards**: Daily / weekly / monthly / custom-interval boards with automatic archiving
 - **Category Scoreboards**: Targeted per-level, per-mode, or per-category boards — submit to one specific board by ID, without registering a separate game for each
 - **Achievements**: Unlock tracking with timestamps
@@ -110,7 +109,7 @@ dfx deploy --network ic
 ### 4. Generate Candid Interface
 
 ```bash
-dfx generate cheddaboards
+dfx generate cheddaboards_v2_backend
 ```
 
 You'll need to build your own API layer to translate REST/HTTP requests into canister calls. It must verify OAuth tokens itself (e.g. via JWKS) and call the canister with the signing identity you set as `VERIFIER_PRINCIPAL` — the canister rejects privileged auth calls from anyone else. The Candid interface defines all available methods and their signatures.
@@ -149,7 +148,9 @@ The Candid interface (`cheddaboards.did`) defines the full canister API. Every d
 
 Key methods:
 
-**Authentication**: `socialLoginAndGetProfile`, `anonymousLoginAndGetProfile`, `createSessionForVerifiedUser`, `validateSession`, `destroySession`
+**Authentication**: `socialLoginAndGetProfile`, `createSessionForVerifiedUser`, `validateSession`, `destroySession`
+
+**Account linking**: `migrateAnonymousAccount`, `migrateAnonymousToII` (merge an anonymous device profile into a signed-in account; per-field maxima, achievements unioned, play counts summed)
 
 **Scores & Leaderboards**: `submitScore`, `submitScoreToBoard`, `getScoreboard`, `getLeaderboard`, `getPlayerRank`, `getPlayerScoreboardRank`
 

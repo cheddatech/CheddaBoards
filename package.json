@@ -1,10 +1,10 @@
 {
   "name": "cheddaboards",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "description": "Open-source backend canister for CheddaBoards — leaderboards, achievements, and player profiles on the Internet Computer",
   "private": true,
   "scripts": {
-    "generate-did": "dfx generate cheddaboards",
+    "generate-did": "dfx generate cheddaboards_v2_backend",
     "deploy:local": "dfx deploy --network local",
     "deploy:ic": "dfx deploy --network ic --mode upgrade",
     "test": "echo \"No tests yet\" && exit 0"

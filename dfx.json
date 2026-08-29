@@ -1,25 +1,16 @@
 {
-  "version": 1,
   "canisters": {
-    "cheddaboards": {
-      "type": "motoko",
-      "main": "src/main.mo"
+    "cheddaboards_v2_backend": {
+      "main": "src/cheddaboards_v2_backend/main.mo",
+      "type": "motoko"
     }
   },
   "defaults": {
     "build": {
+      "args": "--legacy-persistence",
       "packtool": ""
     }
   },
-  "networks": {
-    "local": {
-      "bind": "127.0.0.1:4943",
-      "type": "ephemeral"
-    },
-    "ic": {
-      "providers": ["https://icp-api.io"],
-      "type": "persistent"
-    }
-  },
-  "output_env_file": ".env.dfx"
+  "output_env_file": ".env",
+  "version": 1
 }
