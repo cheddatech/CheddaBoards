@@ -4,6 +4,21 @@ This changelog starts on 2026-08-18. Earlier changes weren't tracked in this
 repo, so the first entry below is a catch-up covering everything since the
 previous public update. Per-release entries begin from here.
 
+## v0.9.0 — 2026-09-24
+
+### Security
+- Verifier gate collapsed to a single verifier principal; the previous key is no longer accepted.
+
+### Changed
+- Moved from legacy persistence to enhanced orthogonal persistence (EOP).
+  **Self-hosters upgrading an existing canister:** this is a one-way switch. Take a snapshot first; dfx.json now builds with `--enhanced-orthogonal-persistence`.
+- Game ID validation on the principal registration path; name/description length caps; stats fixes for category-board submits; play-count de-duplication.
+
+### Added
+- HTTP board reads served directly by the canister: `GET /games/{gameId}/scoreboards/{boardId}?limit=N` on the raw domain, same JSON as the API, CORS-open.
+- Deleted board IDs can be reused; the recreated board starts with a clean archive history.
+- Expired soft-deleted games are now swept on dashboard deletes too.
+
 ## 2026-08-29 (v0.8.1)
 
 Sync of the public repo to production. From this release the public repo is

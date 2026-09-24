@@ -7,7 +7,7 @@
   },
   "defaults": {
     "build": {
-      "args": "--legacy-persistence",
+      "args": "--enhanced-orthogonal-persistence",
       "packtool": ""
     }
   },

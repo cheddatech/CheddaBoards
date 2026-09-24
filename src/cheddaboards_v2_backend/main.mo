@@ -116,6 +116,10 @@ persistent actor CheddaBoards {
   // force-reassigned in postupgrade(); edit VERIFIER_PRINCIPAL only.
   private transient let VERIFIER_PRINCIPAL : Text = "aaaaa-aa";
   var VERIFIER : Principal = Principal.fromText(VERIFIER_PRINCIPAL);
+
+  private func isVerifier(p : Principal) : Bool {
+      p == VERIFIER
+  };
   
   // ════════════════════════════════════════════════════════════════════════════
   // STABLE STORAGE
@@ -188,6 +192,16 @@ persistent actor CheddaBoards {
   private transient var games = HashMap.HashMap<Text, GameInfo>(10, Text.equal, Text.hash);
   private transient var sessions = HashMap.HashMap<Text, Session>(10, Text.equal, Text.hash);
   private transient var lastSubmitTime = HashMap.HashMap<Text, Nat64>(10, Text.equal, Text.hash);
+  // PLAY-DEDUPE 2026-09-08: since the 2026-08-31 stats fix, EVERY submit path
+  // counts a play, so one run fanned out to N boards as N client calls counted
+  // N plays (Scooter Dash: main + 2 targeted = +3 per run). A play now counts
+  // at most once per window per (player, game), shared across submitScore and
+  // submitScoreToBoard. Deliberately transient and NOT copied through
+  // preupgrade: worst case after a deploy is one double-counted play per
+  // mid-window player, and transient means the window literal below actually
+  // takes effect on upgrade (VERIFIER stable-let lesson).
+  private transient let PLAY_DEDUPE_WINDOW_NS : Nat64 = 5_000_000_000; // 5s
+  private transient var lastPlayCounted = HashMap.HashMap<Text, Nat64>(10, Text.equal, Text.hash);
   private transient var cachedLeaderboards = HashMap.HashMap<Text, [(Text, Nat64, Nat64, Text)]>(10, Text.equal, Text.hash);
   private transient var leaderboardLastUpdate = HashMap.HashMap<Text, Nat64>(10, Text.equal, Text.hash);
   private transient let LEADERBOARD_CACHE_TTL : Nat64 = 60_000_000_000;
@@ -1725,6 +1739,103 @@ private func createDefaultScoreboards(gameId : Text, owner : Principal) : () {
     #ok("Cleaned up " # Nat.toText(count) # " expired games")
   };
 
+  // STATS FIX 2026-08-31: one-shot repair for history. Walks LIVE entries on
+  // TARGETED boards and, for every player who has no gameProfile for that
+  // game, creates the 0/0 profile and counts their entries as plays. Players
+  // who already have a profile are skipped entirely — submitScore counted
+  // them at the time, and their targeted plays before today are
+  // unrecoverable without double-count risk, so we take the honest floor.
+  // IDEMPOTENT: a second run finds no missing profiles and changes nothing.
+  // Pass null for all games or ?"game-id" for one.
+  public shared(msg) func adminBackfillBoardStats(gameFilter : ?Text) : async Result.Result<Text, Text> {
+    if (not isAdmin(msg.caller)) {
+      return #err("Only admin can run the stats backfill");
+    };
+
+    // Players registered by THIS run, so their 2nd..nth board entries within
+    // the same game accumulate into play_count instead of being skipped as
+    // "already profiled". Key: gameId # "\n" # identifier text.
+    let createdThisRun = HashMap.HashMap<Text, Bool>(64, Text.equal, Text.hash);
+    let newPlayersByGame = HashMap.HashMap<Text, Nat>(16, Text.equal, Text.hash);
+    let playsByGame = HashMap.HashMap<Text, Nat>(16, Text.equal, Text.hash);
+    var orphanedEntries : Nat = 0;
+
+    for ((sbKey, config) in scoreboardConfigs.entries()) {
+      let inScope = switch (gameFilter) {
+        case null { true };
+        case (?g) { config.gameId == g };
+      };
+      if (inScope and config.targeted == ?true) {
+        switch (games.get(config.gameId)) {
+          case null {}; // orphaned config after a game deletion — nothing to credit
+          case (?_) {
+            switch (scoreboardEntries.get(sbKey)) {
+              case null {};
+              case (?entries) {
+                for (entry in entries.vals()) {
+                  switch (getUserByIdentifier(entry.odentifier)) {
+                    case null { orphanedEntries += 1 }; // deleted account
+                    case (?player) {
+                      let runKey = config.gameId # "\n" # identifierToText(entry.odentifier);
+                      var hasProfile = false;
+                      for ((gId, _) in player.gameProfiles.vals()) {
+                        if (gId == config.gameId) { hasProfile := true };
+                      };
+                      let createdNow = Option.isSome(createdThisRun.get(runKey));
+                      if (not hasProfile or createdNow) {
+                        let (bumpedProfiles, newToGame) =
+                          registerBoardPlay(player, config.gameId, entry.submittedAt, true);
+                        putUserByIdentifier({
+                          identifier = player.identifier;
+                          nickname = player.nickname;
+                          authType = player.authType;
+                          gameProfiles = bumpedProfiles;
+                          created = player.created;
+                          last_updated = player.last_updated;
+                        });
+                        if (newToGame) {
+                          createdThisRun.put(runKey, true);
+                          newPlayersByGame.put(
+                            config.gameId,
+                            Option.get(newPlayersByGame.get(config.gameId), 0) + 1
+                          );
+                        };
+                        playsByGame.put(
+                          config.gameId,
+                          Option.get(playsByGame.get(config.gameId), 0) + 1
+                        );
+                      };
+                    };
+                  };
+                };
+              };
+            };
+          };
+        };
+      };
+    };
+
+    var gamesTouched : Nat = 0;
+    var totalNewPlayers : Nat = 0;
+    var totalPlaysAdded : Nat = 0;
+    for ((gameId, plays) in playsByGame.entries()) {
+      let newPlayers = Option.get(newPlayersByGame.get(gameId), 0);
+      switch (games.get(gameId)) {
+        case (?gameInfo) {
+          games.put(gameId, updateGameStats(gameInfo, newPlayers, plays));
+          gamesTouched += 1;
+          totalNewPlayers += newPlayers;
+          totalPlaysAdded += plays;
+        };
+        case null {};
+      };
+    };
+
+    #ok("\u{1F527} Backfill complete: " # Nat.toText(totalNewPlayers) # " players registered, "
+      # Nat.toText(totalPlaysAdded) # " plays counted across " # Nat.toText(gamesTouched)
+      # " games (" # Nat.toText(orphanedEntries) # " orphaned entries skipped)")
+  };
+
   // ═══════════════════════════════════════════════════════════════════════════════
 // ═══════════════════════════════════════════════════════════════════════════════
 // ACCOUNT MIGRATION: Anonymous → Verified (Google/Apple/II)
@@ -2745,6 +2856,142 @@ system func postupgrade() {
   // HTTP INTERFACE
   // ════════════════════════════════════════════════════════════════════════════
 
+  // ── HTTP board reads (invocation cut: reads bypass the Netlify proxy) ───────
+  // Served over the raw domain (https://<canister-id>.raw.icp0.io). Response
+  // shape mirrors the Netlify proxy (api.js v1.7.1) exactly, so clients migrate
+  // by swapping the base URL only:
+  //   200: {"ok":true,"data":{"scoreboardId","config",
+  //         "entries","totalEntries"}}
+  //   4xx: {"ok":false,"error":"..."}
+
+  // Escape user-supplied text for JSON. Nicknames are player-controlled, so
+  // this is load-bearing: one quote character in a nickname would otherwise
+  // break the whole board response for every consumer.
+  private func escapeJson(t : Text) : Text {
+    var out = "";
+    for (c in t.chars()) {
+      let code = Char.toNat32(c);
+      if (c == '\"') { out := out # "\\\"" }
+      else if (c == '\\') { out := out # "\\\\" }
+      else if (c == '\n') { out := out # "\\n" }
+      else if (c == '\r') { out := out # "\\r" }
+      else if (c == '\t') { out := out # "\\t" }
+      else if (code < 32) { out := out # " " } // drop other control chars
+      else { out := out # Text.fromChar(c) };
+    };
+    out
+  };
+
+  // Minimal digit parser for query params (avoids Nat.fromText dependency).
+  // Caller caps input length before calling.
+  private func parseNatParam(t : Text) : ?Nat {
+    var n : Nat = 0;
+    var any = false;
+    for (c in t.chars()) {
+      let d = Char.toNat32(c);
+      if (d >= 48 and d <= 57) {
+        n := n * 10 + Nat32.toNat(d - 48);
+        any := true;
+      } else { return null };
+    };
+    if (any) { ?n } else { null }
+  };
+
+  private func httpJson(status : Nat16, body : Text) : HttpResponse {
+    {
+      status_code = status;
+      headers = [
+        ("Content-Type", "application/json"),
+        ("Access-Control-Allow-Origin", "*"),
+        // Keyless GETs with no custom headers are CORS "simple requests",
+        // so no OPTIONS preflight handling is needed.
+        ("Cache-Control", "public, max-age=30")
+      ];
+      body = Text.encodeUtf8(body);
+      streaming_strategy = null;
+    }
+  };
+
+  private func httpError(status : Nat16, message : Text) : HttpResponse {
+    httpJson(status, "{\"ok\":false,\"error\":\"" # escapeJson(message) # "\"}")
+  };
+
+  private func serveScoreboardJson(gameId : Text, scoreboardId : Text, limitOpt : ?Nat) : HttpResponse {
+    let key = makeScoreboardKey(gameId, scoreboardId);
+
+    switch (scoreboardConfigs.get(key)) {
+      case null {
+        return httpError(404, "Scoreboard not found");
+      };
+      case (?config) {
+        if (not config.isActive) {
+          // Proxy surfaces the canister's #err as 404; mirror that.
+          return httpError(404, "Scoreboard is not active");
+        };
+
+        // Mirror the proxy route's limit handling: default 100, clamp 1..1000.
+        var limit : Nat = switch (limitOpt) { case null 100; case (?l) l };
+        if (limit < 1) { limit := 1 };
+        if (limit > 1000) { limit := 1000 };
+        // Then the canister-side cap, as getScoreboard applies it.
+        let cap = if (limit > config.maxEntries) { config.maxEntries } else { limit };
+
+        // Mirror getScoreboard: expired period reads as empty; the actual
+        // reset happens lazily on the next write path.
+        let isExpired = switch (config.period) {
+          case (#allTime) { false };
+          case (#custom) { false };
+          case (#daily) { Scoreboards.shouldResetDaily(config.lastReset, now()) };
+          case (#weekly) { Scoreboards.shouldResetWeekly(config.lastReset, now()) };
+          case (#monthly) { Scoreboards.shouldResetMonthly(config.lastReset, now()) };
+        };
+
+        let sortByText = switch (config.sortBy) { case (#score) "score"; case (#streak) "streak" };
+
+        var entriesJson = "";
+        var emitted : Nat = 0;
+
+        if (not isExpired) {
+          let buffer = switch (scoreboardEntries.get(key)) {
+            case null { Buffer.Buffer<ScoreEntry>(0) };
+            case (?b) { b };
+          };
+
+          let sorted = Scoreboards.sortEntries(Buffer.toArray(buffer), config.sortBy);
+
+          label emit for (entry in sorted.vals()) {
+            if (emitted >= cap) { break emit };
+            if (emitted > 0) { entriesJson := entriesJson # "," };
+            entriesJson := entriesJson # "{"
+              # "\"rank\":" # Nat.toText(emitted + 1) # ","
+              # "\"nickname\":\"" # escapeJson(entry.nickname) # "\","
+              # "\"score\":" # Nat64.toText(entry.score) # ","
+              # "\"streak\":" # Nat64.toText(entry.streak) # ","
+              # "\"authType\":\"" # authTypeToText(entry.authType) # "\","
+              # "\"submittedAt\":" # Nat64.toText(entry.submittedAt)
+              # "}";
+            emitted += 1;
+          };
+        };
+
+        let json = "{\"ok\":true,\"data\":{"
+          # "\"scoreboardId\":\"" # escapeJson(scoreboardId) # "\","
+          # "\"config\":{"
+            # "\"name\":\"" # escapeJson(config.name) # "\","
+            # "\"description\":\"" # escapeJson(config.description) # "\","
+            # "\"period\":\"" # periodToText(config.period) # "\","
+            # "\"sortBy\":\"" # sortByText # "\","
+            # "\"lastReset\":" # Nat64.toText(config.lastReset)
+          # "},"
+          # "\"entries\":[" # entriesJson # "],"
+          # "\"totalEntries\":" # Nat.toText(emitted)
+        # "}}";
+
+        httpJson(200, json)
+      };
+    }
+  };
+
   public query func http_request(request : HttpRequest) : async HttpResponse {
   
     if (request.url == "/.well-known/ii-alternative-origins" or 
@@ -2772,6 +3019,30 @@ system func postupgrade() {
       };
     };
     
+    // Public board reads: GET /games/{gameId}/scoreboards/{boardId}[?limit=N]
+    let urlParts = Iter.toArray(Text.split(request.url, #char '?'));
+    let path = urlParts[0];
+    let queryString = if (urlParts.size() > 1) { urlParts[1] } else { "" };
+
+    // Filtering empty segments also absorbs trailing slashes
+    // (community-dungeon's client requests ".../last-login/").
+    let segs = Array.filter<Text>(
+      Iter.toArray(Text.split(path, #char '/')),
+      func(s : Text) : Bool { s != "" }
+    );
+
+    if (segs.size() == 4 and segs[0] == "games" and segs[2] == "scoreboards") {
+      var limitOpt : ?Nat = null;
+      for (param in Text.split(queryString, #char '&')) {
+        let kv = Iter.toArray(Text.split(param, #char '='));
+        // Length cap keeps parseNatParam from chewing absurd inputs.
+        if (kv.size() == 2 and kv[0] == "limit" and Text.size(kv[1]) <= 6) {
+          limitOpt := parseNatParam(kv[1]);
+        };
+      };
+      return serveScoreboardJson(segs[1], segs[3], limitOpt);
+    };
+
     {
       status_code = 404;
       headers = [];
@@ -3694,7 +3965,14 @@ public shared(msg) func registerGame(
         if (remaining == 0) {
           return #err("Rate limit exceeded. You can only delete 3 games per hour.");
         };
-        
+
+        // Opportunistic sweep (mirrors deleteGame): permanently remove games
+        // whose 30-day recovery window has expired. Dashboard deletes come
+        // through this BySession path, so without this call the sweep almost
+        // never fires and expired soft-deletes accumulate until an admin runs
+        // cleanupExpiredGames manually.
+        cleanupDeletedGames();
+
         switch (games.get(gameId)) {
           case null { return #err("Game not found") };
           case (?game) {
@@ -3857,6 +4135,70 @@ public shared(msg) func registerGame(
       appleBundleId = game.appleBundleId;
       appleTeamId = game.appleTeamId;
     }
+  };
+
+  // STATS FIX 2026-08-31: returns the user's gameProfiles with this game's
+  // play counted, plus whether the player was new to the game. A missing
+  // profile is created at 0/0: targeted-board scores must NEVER leak into the
+  // aggregate total_score / best_streak, because category boards have their
+  // own score semantics (a garrison-mode score is not an all-time score).
+  // Only play_count and last_played move. last_played takes the max so the
+  // backfill can pass historical entry timestamps without rolling an active
+  // player backwards.
+  // PLAY-DEDUPE 2026-09-08: countPlay=false still creates a missing profile
+  // and advances last_played, but leaves play_count alone — a later board
+  // submit in an already-counted run must not count again. The backfill
+  // always passes true (historical timestamps, no dedupe).
+  private func registerBoardPlay(
+    u : UserProfile,
+    gameId : Text,
+    t : Nat64,
+    countPlay : Bool
+  ) : ([(Text, GameProfile)], Bool) {
+    var found = false;
+    let profiles = Buffer.Buffer<(Text, GameProfile)>(u.gameProfiles.size() + 1);
+    for ((gId, gp) in u.gameProfiles.vals()) {
+      if (gId == gameId) {
+        found := true;
+        profiles.add((gId, {
+          gameId = gp.gameId;
+          total_score = gp.total_score;
+          best_streak = gp.best_streak;
+          achievements = gp.achievements;
+          last_played = if (t > gp.last_played) t else gp.last_played;
+          play_count = gp.play_count + (if (countPlay) 1 else 0);
+        }));
+      } else {
+        profiles.add((gId, gp));
+      };
+    };
+    if (not found) {
+      profiles.add((gameId, {
+        gameId = gameId;
+        total_score = 0;
+        best_streak = 0;
+        achievements = [];
+        last_played = t;
+        play_count = if (countPlay) 1 else 0;
+      }));
+    };
+    (Buffer.toArray(profiles), not found)
+  };
+
+  // PLAY-DEDUPE 2026-09-08: pure check — true if a play was already counted
+  // for this player+game within the window. Underflow-guarded (t >= prev)
+  // per the Nat64 underflow sweep. Marking is separate (markPlayCounted) so
+  // a submit that is REJECTED after this check never burns the window and
+  // suppresses the count of a valid retry.
+  private func playCountedRecently(identifier : UserIdentifier, gameId : Text, t : Nat64) : Bool {
+    switch (lastPlayCounted.get(makeSubmitKey(identifier, gameId))) {
+      case (?prev) { t >= prev and t - prev < PLAY_DEDUPE_WINDOW_NS };
+      case null { false };
+    };
+  };
+
+  private func markPlayCounted(identifier : UserIdentifier, gameId : Text, t : Nat64) {
+    lastPlayCounted.put(makeSubmitKey(identifier, gameId), t);
   };
 
 
@@ -4590,7 +4932,7 @@ public shared func revokeApiKeyBySession(
     // The caller MUST be the trusted verifier (same gate as
     // createSessionForVerifiedUser). The verifier is responsible for validating
     // the Google/Apple token before calling this with the verified email.
-    if (msg.caller != VERIFIER) {
+    if (not isVerifier(msg.caller)) {
       return #err("Unauthorized: login must go through the verifier");
     };
 
@@ -4687,7 +5029,7 @@ public shared func revokeApiKeyBySession(
     nonce : Text
   ) : async Result.Result<Session, Text> {
 
-    if (caller != VERIFIER) {
+    if (not isVerifier(caller)) {
       return #err("Unauthorized: caller is not verifier");
     };
 
@@ -5161,6 +5503,10 @@ public shared func revokeApiKeyBySession(
           };
         };
 
+        // PLAY-DEDUPE 2026-09-08: one play per run, even when the run also
+        // submits to targeted boards. Marked only after the write commits.
+        let countPlay = not playCountedRecently(u.identifier, gameId, t);
+
         var gameProfiles = Buffer.Buffer<(Text, GameProfile)>(u.gameProfiles.size());
         var found = false;
         var scoreImproved = false;
@@ -5213,7 +5559,7 @@ public shared func revokeApiKeyBySession(
               best_streak = updatedStreak;
               achievements = gProfile.achievements;
               last_played = t;
-              play_count = gProfile.play_count + 1;
+              play_count = gProfile.play_count + (if (countPlay) 1 else 0);
             };
             gameProfiles.add((gId, updated));
           } else {
@@ -5228,7 +5574,7 @@ public shared func revokeApiKeyBySession(
             best_streak = streak;
             achievements = [];
             last_played = t;
-            play_count = 1;
+            play_count = if (countPlay) 1 else 0;
           };
           gameProfiles.add((gameId, newGameProfile));
           scoreImproved := true;
@@ -5236,14 +5582,14 @@ public shared func revokeApiKeyBySession(
           
           switch (games.get(gameId)) {
             case (?gameInfo) {
-              games.put(gameId, updateGameStats(gameInfo, 1, rounds));
+              games.put(gameId, updateGameStats(gameInfo, 1, if (countPlay) rounds else 0));
             };
             case null {};
           };
         } else {
           switch (games.get(gameId)) {
             case (?gameInfo) {
-              games.put(gameId, updateGameStats(gameInfo, 0, rounds));
+              games.put(gameId, updateGameStats(gameInfo, 0, if (countPlay) rounds else 0));
             };
             case null {};
           };
@@ -5259,6 +5605,7 @@ public shared func revokeApiKeyBySession(
         };
         
         putUserByIdentifier(updatedUser);
+        if (countPlay) { markPlayCounted(u.identifier, gameId, t) };
         
         if (scoreImproved) {
           cachedLeaderboards.delete(gameId # ":score");
@@ -5489,8 +5836,33 @@ public shared func revokeApiKeyBySession(
           };
         };
 
-        // Write to JUST this board. No aggregate gameProfile / all-time mutation.
+        // Write to JUST this board. Aggregate total_score / best_streak are
+        // still never touched — but the play IS counted now. STATS FIX
+        // 2026-08-31: previously targeted-only games showed Players 0 /
+        // Plays 0 because only submitScore called updateGameStats, and their
+        // players never got a gameProfile (invisible to Player Card).
         writeEntryToBoard(sbKey, config, u.identifier, effectiveNick, score, streak, u.authType, t);
+
+        // PLAY-DEDUPE 2026-09-08: whichever submit of a run lands first
+        // (main or targeted) counts the play; the rest within the window
+        // still write their board entry but add no play.
+        let countPlay = not playCountedRecently(u.identifier, gameId, t);
+        let (bumpedProfiles, newToGame) = registerBoardPlay(u, gameId, t, countPlay);
+        putUserByIdentifier({
+          identifier = u.identifier;
+          nickname = effectiveNick;
+          authType = u.authType;
+          gameProfiles = bumpedProfiles;
+          created = u.created;
+          last_updated = t;
+        });
+        if (countPlay) { markPlayCounted(u.identifier, gameId, t) };
+        switch (games.get(gameId)) {
+          case (?gameInfo) {
+            games.put(gameId, updateGameStats(gameInfo, if (newToGame) 1 else 0, if (countPlay) 1 else 0));
+          };
+          case null {};
+        };
 
         trackEventInternal(u.identifier, gameId, "board_score", [
           ("scoreboardId", scoreboardId),
@@ -5605,6 +5977,19 @@ public shared func revokeApiKeyBySession(
         (removed, sample)
       };
     };
+  };
+
+  /// Delete ALL archives for one board. Used when a soft-deleted board's ID
+  /// is reused at creation, so the recreated board starts with a clean
+  /// history instead of inheriting the dead board's archived periods.
+  /// Collects keys first, then deletes (no mutation while iterating).
+  private func purgeScoreboardArchives(gameId : Text, scoreboardId : Text) : () {
+    let prefix = gameId # ":" # scoreboardId # ":";
+    let toDelete = Buffer.Buffer<Text>(8);
+    for ((key, _) in scoreboardArchives.entries()) {
+      if (Text.startsWith(key, #text prefix)) { toDelete.add(key) };
+    };
+    for (key in toDelete.vals()) { scoreboardArchives.delete(key) };
   };
 
   /// Remove playerKey's rows from archives. scoreboardId = null → all boards
@@ -6806,9 +7191,15 @@ public shared func revokeApiKeyBySession(
 
         let key = makeScoreboardKey(gameId, scoreboardId);
         
-        // Check if scoreboard already exists
+        // Check if scoreboard already exists (soft-deleted tombstones don't
+        // count — recreating a deleted board's ID replaces the tombstone)
         switch (scoreboardConfigs.get(key)) {
-          case (?_) { return #err("Scoreboard ID already exists for this game") };
+          case (?existing) {
+            if (existing.isActive) {
+              return #err("Scoreboard ID already exists for this game");
+            };
+            purgeScoreboardArchives(gameId, scoreboardId);
+          };
           case null {};
         };
 
@@ -7513,9 +7904,15 @@ public shared func revokeApiKeyBySession(
 
     let key = makeScoreboardKey(gameId, scoreboardId);
 
-    // Already exists?
+    // Already exists? (soft-deleted tombstones don't count — recreating a
+    // deleted board's ID replaces the tombstone)
     switch (scoreboardConfigs.get(key)) {
-      case (?_) { return #err("Scoreboard ID already exists for this game") };
+      case (?existing) {
+        if (existing.isActive) {
+          return #err("Scoreboard ID already exists for this game");
+        };
+        purgeScoreboardArchives(gameId, scoreboardId);
+      };
       case null {};
     };
 
