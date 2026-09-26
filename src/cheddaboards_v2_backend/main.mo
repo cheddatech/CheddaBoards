@@ -24,6 +24,7 @@ import Random "mo:base/Random";
 import Hash "mo:base/Hash";
 import Int "mo:base/Int";
 import Nat32 "mo:base/Nat32";
+import Nat8 "mo:base/Nat8";
 import Error "mo:base/Error";
 import Char "mo:base/Char";
 import Timer "mo:base/Timer";
@@ -119,6 +120,56 @@ persistent actor CheddaBoards {
 
   private func isVerifier(p : Principal) : Bool {
       p == VERIFIER
+  };
+
+  // ── RANDOM TOKENS (v0.10.0) ──────────────────────────────────────────────
+  // Session tokens, play-session tokens and API keys used to be built from
+  // timestamps + counters, which are guessable (block times are public via
+  // submittedAt). They now come from the management canister's raw_rand.
+  // A small transient pool keeps minting synchronous in the common case:
+  // takeRandomBytes only awaits when the pool is empty (first mint after a
+  // deploy), and tops the pool up in the background as it drains.
+  private transient let entropyPool = Buffer.Buffer<Nat8>(512);
+  private transient let ENTROPY_TARGET : Nat = 512;
+  private transient let ENTROPY_LOW_WATER : Nat = 128;
+  private transient var entropyRefilling : Bool = false;
+
+  private func topUpEntropy() : async () {
+    if (entropyRefilling) { return };
+    entropyRefilling := true;
+    try {
+      var rounds = 0;
+      while (entropyPool.size() < ENTROPY_TARGET and rounds < 16) {
+        let b = await Random.blob();
+        for (byte in b.vals()) { entropyPool.add(byte) };
+        rounds += 1;
+      };
+    } catch (_) {};
+    entropyRefilling := false;
+  };
+
+  private func takeRandomBytes(n : Nat) : async* [Nat8] {
+    while (entropyPool.size() < n) {
+      let b = await Random.blob();
+      for (byte in b.vals()) { entropyPool.add(byte) };
+    };
+    let size = entropyPool.size();
+    let out = Array.tabulate<Nat8>(n, func(i : Nat) : Nat8 { entropyPool.get(size - n + i) });
+    var k = 0;
+    while (k < n) { ignore entropyPool.removeLast(); k += 1 };
+    if (entropyPool.size() < ENTROPY_LOW_WATER and not entropyRefilling) {
+      ignore topUpEntropy();
+    };
+    out
+  };
+
+  private func toHex(bytes : [Nat8]) : Text {
+    let digits = ["0","1","2","3","4","5","6","7","8","9","a","b","c","d","e","f"];
+    var out = "";
+    for (b in bytes.vals()) {
+      out := out # digits[Nat8.toNat(b / 16)] # digits[Nat8.toNat(b % 16)];
+    };
+    out
   };
   
   // ════════════════════════════════════════════════════════════════════════════
@@ -315,11 +366,10 @@ private func getDeveloperTierText(owner: Principal) : Text {
     }
 };
 
-  func generateSessionId() : Text {
+  // v0.10.0: 256 bits from raw_rand (see takeRandomBytes). Counter kept for stats.
+  func generateSessionId(randomBytes : [Nat8]) : Text {
     sessionCounter += 1;
-    let timestamp = now();
-    let _random = Random.Finite(Blob.fromArray([1,2,3,4,5,6,7,8]));
-    "session_" # Nat64.toText(timestamp) # "_" # Nat64.toText(sessionCounter)
+    "session_" # toHex(randomBytes)
   };
 
   func logSuspicion(playerId : Text, gameId : Text, reason : Text) {
@@ -620,12 +670,10 @@ private func getDeveloperTierText(owner: Principal) : Text {
   // PLAY SESSION / TIME VALIDATION HELPERS
   // ═══════════════════════════════════════════════════════════════════════════════
 
-  private func generatePlaySessionToken(identifier: UserIdentifier, gameId: Text) : Text {
-    let timestamp = Int.toText(Time.now());
-    let identifierText = identifierToText(identifier);
-    let combined = gameId # ":" # identifierText # ":" # timestamp;
-    let hash = Text.hash(combined);
-    "ps_" # gameId # "_" # Nat32.toText(hash)
+  // v0.10.0: was a 32-bit Text.hash of gameId:identifier:time (guessable);
+  // now 128 bits from raw_rand. Format prefix unchanged.
+  private func generatePlaySessionToken(gameId: Text, randomBytes : [Nat8]) : Text {
+    "ps_" # gameId # "_" # toHex(randomBytes)
   };
 
   private func getTimeValidationRules(gameId: Text) : {
@@ -1223,8 +1271,12 @@ private func createDefaultScoreboards(gameId : Text, owner : Principal) : () {
     
     // Handle external API users
     if (userIdType == "external") {
-      // External users are validated by API key at proxy level
-      // Just validate the player ID format here
+      // External users are validated by API key at the proxy. v0.10.0: the
+      // canister is directly callable, so only the proxy (VERIFIER) may use
+      // this path — otherwise anyone could write as any player, keyless.
+      if (not isVerifier(msg.caller)) {
+        return #err("Unauthorized: external calls must go through the API");
+      };
       if (not isValidExternalPlayerId(userId)) {
         return #err("Invalid external player ID. Use 1-100 alphanumeric characters, underscore, or hyphen.");
       };
@@ -1917,6 +1969,12 @@ public shared(msg) func migrateAnonymousAccount(
   migratedGames : Nat;
   migratedScoreboards : Nat;
 }, Text> {
+
+  // v0.10.0: proxy-only. Possession of a deviceId is the only proof of
+  // ownership, so the direct-call route is closed.
+  if (not isVerifier(msg.caller)) {
+    return #err("Unauthorized: account migration must go through the API");
+  };
 
   // ── Step 1: Validate the session (proves caller is authenticated) ──
   let session = switch (validateSessionInternal(sessionId)) {
@@ -2758,9 +2816,14 @@ system func postupgrade() {
     cachedLeaderboards := HashMap.HashMap<Text, [(Text, Nat64, Nat64, Text)]>(10, Text.equal, Text.hash);
     leaderboardLastUpdate := HashMap.HashMap<Text, Nat64>(10, Text.equal, Text.hash);
     
+    // v0.10.0 FIX: restore from stableSessions (stable, written by preupgrade).
+    // This used to read sessionsEntries, which is `transient` and therefore
+    // always [] after an upgrade, so every deploy silently logged out every
+    // signed-in player and developer.
     sessions := HashMap.fromIter<Text, Session>(
-        sessionsEntries.vals(), 10, Text.equal, Text.hash
+        stableSessions.vals(), 10, Text.equal, Text.hash
     );
+    stableSessions := [];
     principalToSession := HashMap.fromIter<Text, Text>(
         principalToSessionEntries.vals(), 10, Text.equal, Text.hash
     );
@@ -4555,7 +4618,9 @@ public shared query(msg) func getRemainingGameSlots() : async Nat {
       return #err("Active API key exists. Revoke it first to generate a new one.");
     };
     
-    let newKey = ApiKeys.createKey(gameId, msg.caller);
+    // v0.10.0: replace the module's timestamp-based key string with raw_rand.
+    let baseKey = ApiKeys.createKey(gameId, msg.caller);
+    let newKey = { baseKey with key = "cb_" # gameId # "_" # toHex(await* takeRandomBytes(16)) };
     apiKeys.put(newKey.key, newKey);
     
     trackEventInternal(#principal(msg.caller), gameId, "api_key_generated", [
@@ -4593,7 +4658,9 @@ public shared query(msg) func getRemainingGameSlots() : async Nat {
     ApiKeys.validate(apiKeys, key)
   };
 
-  public shared func validateApiKey(key : Text) : async ?ApiKey {
+  // v0.10.0: verifier-only (public oracle that also bumped usage stats).
+  public shared(msg) func validateApiKey(key : Text) : async ?ApiKey {
+    if (not isVerifier(msg.caller)) { return null };
     switch (apiKeys.get(key)) {
       case null { null };
       case (?apiKey) {
@@ -4673,7 +4740,9 @@ public shared func generateApiKeyBySession(
                         return #err("Active API key exists. Revoke it first to generate a new one.");
                     };
                     
-                    let newKey = ApiKeys.createKey(gameId, owner);
+                    // v0.10.0: replace the module's timestamp-based key string with raw_rand.
+                    let baseKey = ApiKeys.createKey(gameId, owner);
+                    let newKey = { baseKey with key = "cb_" # gameId # "_" # toHex(await* takeRandomBytes(16)) };
                     apiKeys.put(newKey.key, newKey);
                     
                     #ok(newKey.key)
@@ -4971,7 +5040,7 @@ public shared func revokeApiKeyBySession(
       };
     };
     
-    let sessionId = generateSessionId();
+    let sessionId = generateSessionId(await* takeRandomBytes(32));
     let session : Session = {
       sessionId = sessionId;
       email = email;
@@ -5071,7 +5140,7 @@ public shared func revokeApiKeyBySession(
       };
     };
 
-    let sessionToken : Text = generateSessionId();
+    let sessionToken : Text = generateSessionId(await* takeRandomBytes(32));
     let session : Session = {
       sessionId = sessionToken;
       email     = userEmail;
@@ -6424,7 +6493,7 @@ public shared func revokeApiKeyBySession(
     let rules = getTimeValidationRules(gameId);
     let sessionDurationNanos = Nat64.fromNat(rules.maxSessionDurationMins * 60) * 1_000_000_000;
     
-    let token = generatePlaySessionToken(identifier, gameId);
+    let token = generatePlaySessionToken(gameId, await* takeRandomBytes(16));
     
     let session : PlaySession = {
       sessionToken = token;
@@ -6474,7 +6543,7 @@ public shared func revokeApiKeyBySession(
     let rules = getTimeValidationRules(gameId);
     let sessionDurationNanos = Nat64.fromNat(rules.maxSessionDurationMins * 60) * 1_000_000_000;
     
-    let token = generatePlaySessionToken(identifier, gameId);
+    let token = generatePlaySessionToken(gameId, await* takeRandomBytes(16));
     
     let session : PlaySession = {
       sessionToken = token;
@@ -6491,11 +6560,15 @@ public shared func revokeApiKeyBySession(
   };
 
   // Start a game session - API key based users (anonymous/device ID)
-  public shared func startGameSessionByApiKey(
+  public shared(msg) func startGameSessionByApiKey(
     apiKeyValue: Text,
     playerId: Text,
     gameId: Text
   ) : async Result.Result<Text, Text> {
+    // v0.10.0: proxy-only (API keys are checked at the proxy).
+    if (not isVerifier(msg.caller)) {
+      return #err("Unauthorized: play sessions must be started through the API");
+    };
     
     // Validate API key
     switch (apiKeys.get(apiKeyValue)) {
@@ -6543,7 +6616,7 @@ public shared func revokeApiKeyBySession(
     let rules = getTimeValidationRules(gameId);
     let sessionDurationNanos = Nat64.fromNat(rules.maxSessionDurationMins * 60) * 1_000_000_000;
     
-    let token = generatePlaySessionToken(identifier, gameId);
+    let token = generatePlaySessionToken(gameId, await* takeRandomBytes(16));
     
     let session : PlaySession = {
       sessionToken = token;
@@ -6591,6 +6664,10 @@ public shared func revokeApiKeyBySession(
 
   // Cancel a play session (if player quits without submitting)
   public shared(msg) func cancelPlaySession(sessionToken: Text) : async Result.Result<Text, Text> {
+    // v0.10.0: proxy-only.
+    if (not isVerifier(msg.caller)) {
+      return #err("Unauthorized: play sessions must be cancelled through the API");
+    };
     switch (playSessions.get(sessionToken)) {
       case null { #err("Session not found") };
       case (?session) {
@@ -6698,7 +6775,8 @@ public shared func revokeApiKeyBySession(
   // SESSION QUERIES
   // ════════════════════════════════════════════════════════════════════════════
   
-  public query func getSessionInfo(sessionId : Text) : async ?{
+  // v0.10.0: verifier-only (returned the email for any valid token).
+  public shared query(msg) func getSessionInfo(sessionId : Text) : async ?{
     email: Text;
     nickname: Text;
     authType: Text;
@@ -6706,6 +6784,7 @@ public shared func revokeApiKeyBySession(
     expires: Nat64;
     lastUsed: Nat64;
   } {
+    if (not isVerifier(msg.caller)) { return null };
     switch (sessions.get(sessionId)) {
       case (?session) {
         ?{
@@ -8412,13 +8491,15 @@ public shared func revokeApiKeyBySession(
   // ANALYTICS
   // ════════════════════════════════════════════════════════════════════════════
 
-  public shared func trackEvent(
+  // v0.10.0: verifier-only (was fully open: anyone could flood analytics).
+  public shared(msg) func trackEvent(
     userIdType : Text,
     userId : Text,
     eventType : Text,
     gameId : Text,
     metadata : [(Text, Text)]
   ) : async () {
+    if (not isVerifier(msg.caller)) { return };
     let identifier : UserIdentifier = switch (userIdType) {
       case ("email") { #email(userId) };
       case ("principal") { #principal(Principal.fromText(userId)) };
@@ -8475,7 +8556,8 @@ public shared func revokeApiKeyBySession(
     }
   };
 
-  public query func getRecentEvents(limit : Nat) : async [AnalyticsEvent] {
+  public shared query(msg) func getRecentEvents(limit : Nat) : async [AnalyticsEvent] {
+    if (not isAdmin(msg.caller)) { return [] };
     let cap = if (limit > 100) { 100 } else { limit };
     let size = analyticsEvents.size();
     

@@ -4,6 +4,23 @@ This changelog starts on 2026-08-18. Earlier changes weren't tracked in this
 repo, so the first entry below is a catch-up covering everything since the
 previous public update. Per-release entries begin from here.
 
+## v0.10.0 — 2026-09-26
+
+### Security
+- External (API-key) player writes are now accepted only from the verifier principal. Score submits, targeted board submits, achievement unlocks and nickname changes on the `external` path can no longer be made by calling the canister directly.
+- Proxy-only entry points now require the verifier: `migrateAnonymousAccount`, `startGameSessionByApiKey`, `cancelPlaySession`.
+- `getSessionInfo`, `trackEvent` and `validateApiKey` are now verifier-only.
+- `getRecentEvents` is now admin-only; analytics events carry player identifiers and should never have been public.
+- Session tokens, play-session tokens and API keys are now generated from `raw_rand` (IC randomness) instead of timestamps and counters. Existing sessions and keys remain valid.
+
+### Fixed
+- Sessions now survive canister upgrades. `postupgrade` was restoring sessions from a transient variable, so every upgrade signed out all signed-in players and developers.
+
+### Notes for self-hosters
+- **Your proxy must make every canister call signed as the verifier identity**, including external score submits. A proxy that calls anonymously for writes will get `Unauthorized` after this upgrade.
+- New token formats: sessions are `session_` + 64 hex characters, play tokens `ps_<gameId>_` + 32 hex, API keys `cb_<gameId>_` + 32 hex. Anything that parses the old numeric formats should be updated.
+- No Candid interface changes.
+
 ## v0.9.0 — 2026-09-24
 
 ### Security
@@ -19,7 +36,7 @@ previous public update. Per-release entries begin from here.
 - Deleted board IDs can be reused; the recreated board starts with a clean archive history.
 - Expired soft-deleted games are now swept on dashboard deletes too.
 
-## 2026-08-29 (v0.8.1)
+## v0.8.1 — 2026-08-29
 
 Sync of the public repo to production. From this release the public repo is
 updated via a git-tracked mirror of the private source, one commit per release.
@@ -64,7 +81,7 @@ updated via a git-tracked mirror of the private source, one commit per release.
   canister. Removed reference to `anonymousLoginAndGetProfile`; documented the
   account-linking migration functions.
 
-## 2026-08-18
+## v0.8.0 — 2026-08-18
 
 ### Security — self-hosters should upgrade
 
