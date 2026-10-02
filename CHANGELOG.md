@@ -4,6 +4,21 @@ This changelog starts on 2026-08-18. Earlier changes weren't tracked in this
 repo, so the first entry below is a catch-up covering everything since the
 previous public update. Per-release entries begin from here.
 
+## v0.11.0 — 2026-09-30
+
+### Removed
+- The Files module has been removed: `files.mo`, the `stableFiles` stable field, the transient file list and its pre/postupgrade copies, and all 7 public file methods (including `uploadFile` and `deleteFile`). It was unused (0 files stored) and only added interface and attack surface.
+- `getSystemInfo` no longer returns `fileCount`.
+
+### Added
+- `memStats` query: reports cycles balance, memory usage and internal map sizes, for capacity monitoring.
+- `GET /metrics` on the raw domain, served directly by the canister: the same capacity figures as JSON, with warning flags when cycles fall under 5T or memory goes over 1.5 GB.
+
+### Notes for self-hosters
+- This release removes Candid methods, so dfx will prompt about a breaking interface change on upgrade. Expected; confirm it. Update any client that calls the file methods or reads `fileCount`.
+- **Existing canisters need a two-step upgrade.** EOP will not implicitly drop a stable field (error M0169). First deploy tag `v0.11.0-migration`, which includes a one-shot `migration.mo` applied via `(with migration = Migration.run)` to drop `stableFiles`, then deploy `v0.11.0`, which retires the migration. Deploying `v0.11.0` directly onto a v0.10.0 canister will be rejected. Fresh installs can go straight to `v0.11.0`.
+- Take a snapshot before upgrading. Each snapshot is a full copy of the heap, so keep one at a time (`dfx canister snapshot create --replace`) to avoid paying cycles for stale copies.
+
 ## v0.10.0 — 2026-09-26
 
 ### Security

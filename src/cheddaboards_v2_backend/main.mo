@@ -28,17 +28,14 @@ import Nat8 "mo:base/Nat8";
 import Error "mo:base/Error";
 import Char "mo:base/Char";
 import Timer "mo:base/Timer";
+import Cycles "mo:base/ExperimentalCycles";
+import Prim "mo:prim";
 
-import Migration "migration";
 import Types "types";
 import ApiKeys "apikeys";
 import Players "players";
 import Scoreboards "scoreboards";
 
-// One-shot migration: drops the retired `stableFiles` field (Files module
-// removed). REMOVE the `with migration` clause and migration.mo after this
-// upgrade has landed on every canister.
-(with migration = Migration.run)
 persistent actor CheddaBoards {
 
   // ════════════════════════════════════════════════════════════════════════════
@@ -2960,6 +2957,122 @@ system func postupgrade() {
     if (any) { ?n } else { null }
   };
 
+  // ── Capacity metrics (cycles / memory / map sizes) ──
+  // Served at GET /metrics for the Upptime "capacity" monitor and as the
+  // memStats() query for dfx. "status":"warn" flips the monitor to degraded.
+  // transient: literal thresholds must not become stable (VERIFIER lesson).
+  private transient let CYCLES_WARN : Nat = 5_000_000_000_000;   // 5T
+  private transient let MEMORY_WARN : Nat = 1_500_000_000;       // 1.5 GB of the 3 GB wasm limit
+
+  private func scoreboardEntryTotal() : Nat {
+    var total = 0;
+    for ((_, buf) in scoreboardEntries.entries()) { total += buf.size() };
+    total
+  };
+
+  private func metricsSnapshot() : {
+    status : Text;
+    cycles : Nat;
+    heapBytes : Nat;
+    memoryBytes : Nat;
+    users : Nat;
+    games : Nat;
+    sessions : Nat;
+    principalToSession : Nat;
+    playSessions : Nat;
+    lastSubmitTime : Nat;
+    lastPlayCounted : Nat;
+    scoreboards : Nat;
+    scoreboardEntries : Nat;
+    cachedScoreboards : Nat;
+    cachedLeaderboards : Nat;
+    scoreboardArchives : Nat;
+    analyticsEvents : Nat;
+    dailyStats : Nat;
+    playerStats : Nat;
+    suspicionLog : Nat;
+    entryDeletionLog : Nat;
+  } {
+    let cycles = Cycles.balance();
+    let memoryBytes = Prim.rts_memory_size();
+    {
+      status = if (cycles < CYCLES_WARN or memoryBytes > MEMORY_WARN) "warn" else "ok";
+      cycles = cycles;
+      heapBytes = Prim.rts_heap_size();
+      memoryBytes = memoryBytes;
+      users = usersByEmail.size() + usersByPrincipal.size();
+      games = games.size();
+      sessions = sessions.size();
+      principalToSession = principalToSession.size();
+      playSessions = playSessions.size();
+      lastSubmitTime = lastSubmitTime.size();
+      lastPlayCounted = lastPlayCounted.size();
+      scoreboards = scoreboardConfigs.size();
+      scoreboardEntries = scoreboardEntryTotal();
+      cachedScoreboards = cachedScoreboards.size();
+      cachedLeaderboards = cachedLeaderboards.size();
+      scoreboardArchives = scoreboardArchives.size();
+      analyticsEvents = analyticsEvents.size();
+      dailyStats = dailyStats.size();
+      playerStats = playerStats.size();
+      suspicionLog = List.size(suspicionLog);
+      entryDeletionLog = List.size(entryDeletionLog);
+    }
+  };
+
+  private func metricsJson() : Text {
+    let m = metricsSnapshot();
+    func f(k : Text, v : Nat) : Text { "\"" # k # "\":" # Nat.toText(v) };
+    "{\"status\":\"" # m.status # "\","
+      # f("cycles", m.cycles) # ","
+      # f("heapBytes", m.heapBytes) # ","
+      # f("memoryBytes", m.memoryBytes) # ","
+      # f("users", m.users) # ","
+      # f("games", m.games) # ","
+      # f("sessions", m.sessions) # ","
+      # f("principalToSession", m.principalToSession) # ","
+      # f("playSessions", m.playSessions) # ","
+      # f("lastSubmitTime", m.lastSubmitTime) # ","
+      # f("lastPlayCounted", m.lastPlayCounted) # ","
+      # f("scoreboards", m.scoreboards) # ","
+      # f("scoreboardEntries", m.scoreboardEntries) # ","
+      # f("cachedScoreboards", m.cachedScoreboards) # ","
+      # f("cachedLeaderboards", m.cachedLeaderboards) # ","
+      # f("scoreboardArchives", m.scoreboardArchives) # ","
+      # f("analyticsEvents", m.analyticsEvents) # ","
+      # f("dailyStats", m.dailyStats) # ","
+      # f("playerStats", m.playerStats) # ","
+      # f("suspicionLog", m.suspicionLog) # ","
+      # f("entryDeletionLog", m.entryDeletionLog)
+      # "}"
+  };
+
+  public query func memStats() : async {
+    status : Text;
+    cycles : Nat;
+    heapBytes : Nat;
+    memoryBytes : Nat;
+    users : Nat;
+    games : Nat;
+    sessions : Nat;
+    principalToSession : Nat;
+    playSessions : Nat;
+    lastSubmitTime : Nat;
+    lastPlayCounted : Nat;
+    scoreboards : Nat;
+    scoreboardEntries : Nat;
+    cachedScoreboards : Nat;
+    cachedLeaderboards : Nat;
+    scoreboardArchives : Nat;
+    analyticsEvents : Nat;
+    dailyStats : Nat;
+    playerStats : Nat;
+    suspicionLog : Nat;
+    entryDeletionLog : Nat;
+  } {
+    metricsSnapshot()
+  };
+
   private func httpJson(status : Nat16, body : Text) : HttpResponse {
     {
       status_code = status;
@@ -3093,6 +3206,11 @@ system func postupgrade() {
       Iter.toArray(Text.split(path, #char '/')),
       func(s : Text) : Bool { s != "" }
     );
+
+    // Capacity monitor: GET /metrics
+    if (segs.size() == 1 and segs[0] == "metrics") {
+      return httpJson(200, metricsJson());
+    };
 
     if (segs.size() == 4 and segs[0] == "games" and segs[2] == "scoreboards") {
       var limitOpt : ?Nat = null;
