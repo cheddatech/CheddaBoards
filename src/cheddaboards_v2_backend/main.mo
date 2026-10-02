@@ -29,12 +29,16 @@ import Error "mo:base/Error";
 import Char "mo:base/Char";
 import Timer "mo:base/Timer";
 
+import Migration "migration";
 import Types "types";
-import Files "files";
 import ApiKeys "apikeys";
 import Players "players";
 import Scoreboards "scoreboards";
 
+// One-shot migration: drops the retired `stableFiles` field (Files module
+// removed). REMOVE the `with migration` clause and migration.mo after this
+// upgrade has landed on every canister.
+(with migration = Migration.run)
 persistent actor CheddaBoards {
 
   // ════════════════════════════════════════════════════════════════════════════
@@ -207,7 +211,6 @@ persistent actor CheddaBoards {
     timestamp : Nat64;
   };
   private var stableEntryDeletionLog : [EntryDeletionRecord] = [];
-  private var stableFiles : [(Text, Blob)] = [];
   private var stableAnalyticsEvents : [AnalyticsEvent] = [];
   private var stableDailyStats : [(Text, DailyStats)] = [];
   private var stablePlayerStats : [(Text, PlayerStats)] = [];
@@ -262,7 +265,6 @@ persistent actor CheddaBoards {
   private transient var apiKeys = HashMap.HashMap<Text, ApiKey>(50, Text.equal, Text.hash);
   private transient var suspicionLog : List.List<{ player_id : Text; gameId : Text; reason : Text; timestamp : Nat64 }> = List.nil();
   private transient var entryDeletionLog : List.List<EntryDeletionRecord> = List.nil();
-  private transient var files : List.List<(Text, Blob)> = List.nil();
   private transient var sessionsEntries : [(Text, Session)] = [];
   private transient var principalToSessionEntries : [(Text, Text)] = [];
   private transient var principalToSession = HashMap.HashMap<Text, Text>(10, Text.equal, Text.hash);
@@ -2584,7 +2586,6 @@ private func repairMigratedStreaksInternal(dryRun : Bool) : Text {
     stableSessions := Iter.toArray(sessions.entries());
     stableSuspicionLog := List.toArray(suspicionLog);
     stableEntryDeletionLog := List.toArray(entryDeletionLog);
-    stableFiles := List.toArray(files);
     stableAnalyticsEvents := Buffer.toArray(analyticsEvents);
     stableDailyStats := Iter.toArray(dailyStats.entries());
     stablePlayerStats := Iter.toArray(playerStats.entries());
@@ -2799,7 +2800,6 @@ system func postupgrade() {
 
     suspicionLog := List.fromArray(stableSuspicionLog);
     entryDeletionLog := List.fromArray(stableEntryDeletionLog);
-    files := List.fromArray(stableFiles);
     
     analyticsEvents := Buffer.fromArray<AnalyticsEvent>(stableAnalyticsEvents);
     
@@ -8573,42 +8573,6 @@ public shared func revokeApiKeyBySession(
     Buffer.toArray(events)
   };
 
-    // ════════════════════════════════════════════════════════════════════════════
-  // FILE MANAGEMENT
-  // ════════════════════════════════════════════════════════════════════════════
-
-  public shared func uploadFile(filename : Text, data : Blob) : async Result.Result<Text, Text> {
-    let result = Files.upload(files, filename, data);
-    files := result.files;
-    result.result
-  };
-
-  public shared func deleteFile(filename : Text) : async Result.Result<Text, Text> {
-    let result = Files.delete(files, filename);
-    files := result.files;
-    result.result
-  };
-
-  public query func listFiles() : async [Text] {
-    Files.list(files)
-  };
-
-  public query func getFile(filename : Text) : async ?Blob {
-    Files.get(files, filename)
-  };
-
-  public query func getFileInfo(filename : Text) : async ?{ name: Text; size: Nat } {
-    Files.getInfo(files, filename)
-  };
-
-  public query func getFileCount() : async Nat {
-    Files.count(files)
-  };
-
-  public query func getTotalStorageUsed() : async Nat {
-    Files.totalSize(files)
-  };
-
   // ════════════════════════════════════════════════════════════════════════════
   // SYSTEM INFO
   // ════════════════════════════════════════════════════════════════════════════
@@ -8619,7 +8583,6 @@ public shared func revokeApiKeyBySession(
     gameCount : Nat;
     totalEvents : Nat;
     activeDays : Nat;
-    fileCount : Nat;
     suspicionLogSize : Nat;
     apiKeyCount : Nat;
     totalSubmissions : Nat;
@@ -8634,7 +8597,6 @@ public shared func revokeApiKeyBySession(
       gameCount = activeGames;
       totalEvents = analyticsEvents.size();
       activeDays = dailyStats.size();
-      fileCount = List.size(files);
       suspicionLogSize = List.size(suspicionLog);
       apiKeyCount = apiKeys.size();
       totalSubmissions = submissionsTotal;
